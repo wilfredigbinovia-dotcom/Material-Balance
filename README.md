@@ -32,6 +32,25 @@ Run `app.py`, not `resmb.py`: `resmb.py` is the library and shows nothing on its
 
 The sidebar switches between four pages: Oil reservoir, Gas reservoir, Multi-tank and PVT correlations. Tables can be edited in place or loaded from a CSV, and results can be downloaded as CSV.
 
+### Bringing in data
+
+The Oil and Gas pages offer three ways to fill the history table:
+
+- **Type in or use a sample.**
+- **By reservoir (one file).** A CSV or Excel file with `t` (days) or `date`, then the table's columns (`p, Np, Gp, ...`), cumulative, first row initial conditions. Add a `reservoir` column to keep several reservoirs in one file and pick one in the app.
+- **By well (two files).** A production file and a pressure survey file. The app sums the wells, averages the surveys and interpolates the cumulatives to each survey date.
+
+| File | Columns | Optional |
+|---|---|---|
+| Well production | `well`, `date` (or `t` in days), `oil`, `gas`, `water` | `reservoir`, `winj`, `ginj` |
+| Pressure surveys | `date` (or `t`), `pressure` | `well`, `reservoir` |
+
+Options for well files: volumes per period or cumulative per well, whether each date marks the end or start of its period, the units of the file, whether to average surveys by date, month, quarter or year, which wells to include, and an initial pressure if there is no survey before production started. Column names are matched without regard to case. Both files must use the same kind of time column. Example files can be downloaded from the app.
+
+PVT columns built from well files are filled from the PVT correlations page. Replace them with lab values where you have them.
+
+On the Multi-tank page, the same two sources load every reservoir in the file as a tank, with the pressure surveys as observed pressures.
+
 To deploy on Streamlit Community Cloud, put `app.py`, `resmb.py` and `requirements.txt` in the root of a GitHub repository and set the main file to `app.py`.
 
 ## Units
@@ -174,12 +193,34 @@ print(match["rms_before"], match["rms_after"], match["fitted"])
 
 `history_match` adjusts every parameter flagged `fit_in_place`, `fit_aquifer` or `fit` to minimise the squared difference from `p_obs`.
 
+## Well data in Python
+
+```python
+import pandas as pd
+from resmb import build_history, BlackOilPVT, oil_mbe
+
+wells = pd.read_csv("well_production.csv")     # well, date, oil (STB), gas (Mscf), water (STB)
+surveys = pd.read_csv("pressure_surveys.csv")  # date, pressure
+
+h = build_history(wells, surveys, volumes="period", period_dates="end",
+                  reservoir="Sand A", group="Q", initial_pressure=None)
+print(h.attrs["notes"])                        # warnings, e.g. no survey at initial conditions
+
+h[["Np", "Wp"]] /= 1e6                         # STB  -> MMSTB
+h["Gp"] /= 1e3                                 # Mscf -> MMscf
+h = BlackOilPVT(api=35, gas_gravity=0.75, temp_f=200, rsb=600).fill(h)
+result = oil_mbe(h, Swi=0.2, m=0.3)
+```
+
+`aggregate_wells` returns the reservoir cumulatives on their own, and `reservoir_table` picks one reservoir out of a multi-reservoir history file.
+
 ## Limitations
 
 - **Matches are not unique.** Fitting tank size and aquifer strength together can give a good pressure match with the wrong values, because a smaller tank with a stronger aquifer behaves much like a larger tank with a weaker one. Fix what you know independently and fit the rest.
 - **A good fit does not prove an aquifer exists.** Fitting an aquifer to a volumetric reservoir returns meaningless aquifer values. Check the Campbell plot (oil) or Cole plot (gas) first.
 - **Crossflow between tanks is reservoir volume only.** The simulator does not track how much of the transferred volume is oil and how much is gas.
 - **One PVT description for all tanks** in a `MultiTank` model.
+- **Pressure surveys are averaged with equal weight.** Surveys from different wells are not weighted by volume or datum-corrected; do that before loading them.
 - **Dry gas only** in `gas_mbe`; no condensate or abnormal-pressure correction.
 
 ## Files

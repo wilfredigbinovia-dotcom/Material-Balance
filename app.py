@@ -12,7 +12,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from resmb import Aquifer, BlackOilPVT, Connection, MultiTank, Tank, gas_mbe, oil_mbe
+from resmb import (Aquifer, BlackOilPVT, Connection, MultiTank, Tank, build_history, common_origin,
+                   gas_mbe, oil_mbe, reservoir_table, standardise_columns)
 
 st.set_page_config(page_title="Reservoir Material Balance", layout="wide")
 
@@ -88,6 +89,8 @@ DEFAULTS = {
     "w_pvt_api": 35.0, "w_pvt_gg": 0.75, "w_pvt_T": 200.0, "w_pvt_known": "Rsb", "w_pvt_rsb": 600.0,
     "w_pvt_pb": 2500.0, "w_pvt_corr": "standing", "w_pvt_pmin": 200.0, "w_pvt_pmax": 4000.0,
     "w_pvt_step": 200.0, "w_mt_dt": 30.0, "w_mt_cw": 3e-6,
+    "w_oil_src": "Type in or use a sample", "w_gas_src": "Type in or use a sample",
+    "w_mt_src": "By reservoir (one file)",
     **{f"w_{p}_aq_{k}": v for p in ("oil", "gas") for k, v in AQ_DEFAULTS.items()},
 }
 ss = st.session_state
@@ -197,22 +200,234 @@ def show_metrics(items):
             c.caption(note)
 
 
-def data_tools(name, columns, samples):
-    """Sample buttons and CSV upload for a single-tank table."""
-    cols = st.columns(len(samples) + 1)
-    for c, (label, df) in zip(cols, samples.items()):
-        if c.button(label, key=f"{name}_{label}"):
-            set_table(name, df.copy())
-            st.rerun()
-    up = st.file_uploader("Or upload a CSV with columns " + ", ".join(columns), type="csv", key=f"{name}_up")
-    if up is not None and ss.get(f"{name}_upid") != up.file_id:
-        ss[f"{name}_upid"] = up.file_id
-        df = pd.read_csv(up)
-        missing = [c for c in columns if c not in df.columns]
-        for c in missing:
-            df[c] = np.nan
-        set_table(name, df[columns].apply(pd.to_numeric, errors="coerce"))
-        st.rerun()
+OIL_UNITS = {"STB": 1e-6, "MSTB": 1e-3, "MMSTB": 1.0}                    # to MMSTB
+GAS_UNITS = {"scf": 1e-6, "Mscf": 1e-3, "MMscf": 1.0, "Bscf": 1e3}        # to MMscf
+GROUPS = {"Each survey date": None, "Month": "M", "Quarter": "Q", "Year": "Y"}
+FILE_TYPES = ["csv", "xlsx", "xls"]
+
+
+def read_any(up):
+    up.seek(0)
+    return pd.read_excel(up) if up.name.lower().endswith((".xlsx", ".xls")) else pd.read_csv(up)
+
+
+@st.cache_data
+def well_templates():
+    """Example well files: three wells that add up to the gas-cap sample."""
+    dates = pd.date_range("2015-01-31", periods=84, freq="ME")
+    start = pd.Timestamp("2015-01-01")
+    days = (dates - start).days.to_numpy(dtype=float)
+    cum = {c: np.interp(days, OIL_GASCAP.t, OIL_GASCAP[c]) for c in ("Np", "Gp", "Wp")}
+    rows = []
+    for k, d in enumerate(dates):
+        share = {"OB-1": 0.5, "OB-2": 0.3, "OB-3": 0.2} if k >= 12 else {"OB-1": 0.6, "OB-2": 0.4}
+        prev = {c: (cum[c][k - 1] if k else 0.0) for c in cum}
+        for w, f in share.items():
+            rows.append(dict(reservoir="Sand A", well=w, date=d.date().isoformat(),
+                             oil=round((cum["Np"][k] - prev["Np"]) * f * 1e6),          # STB
+                             gas=round((cum["Gp"][k] - prev["Gp"]) * f * 1e3),          # Mscf
+                             water=round((cum["Wp"][k] - prev["Wp"]) * f * 1e6)))       # STB
+    pres = []
+    for t, p in zip(OIL_GASCAP.t, OIL_GASCAP.p):
+        d = (start + pd.Timedelta(days=float(t))).date().isoformat()
+        pres += [dict(reservoir="Sand A", well="OB-1", date=d, pressure=p + 6),
+                 dict(reservoir="Sand A", well="OB-2", date=d, pressure=p - 6)]
+    return pd.DataFrame(rows), pd.DataFrame(pres)
+
+
+def well_import(prefix, single=True):
+    """Upload widgets and options for per-well data. Returns the inputs for build_history, or None."""
+    tp, ts = well_templates()
+    c1, c2 = st.columns(2)
+    up1 = c1.file_uploader("Well production (CSV or Excel)", type=FILE_TYPES, key=f"{prefix}_wprod")
+    c1.caption("Columns: well, date (or t in days), oil, gas, water. Optional: reservoir, winj, ginj.")
+    c1.download_button("Example production file", tp.to_csv(index=False), "example_well_production.csv",
+                       "text/csv", key=f"{prefix}_tp")
+    up2 = c2.file_uploader("Pressure surveys (CSV or Excel)", type=FILE_TYPES, key=f"{prefix}_wpres")
+    c2.caption("Columns: date (or t in days), pressure. Optional: well, reservoir.")
+    c2.download_button("Example pressure file", ts.to_csv(index=False), "example_pressure_surveys.csv",
+                       "text/csv", key=f"{prefix}_ts")
+    if up1 is None or up2 is None:
+        return None
+    try:
+        prod, pres = standardise_columns(read_any(up1)), standardise_columns(read_any(up2))
+    except Exception as e:                                       # unreadable file
+        st.error(f"Could not read the file: {e}")
+        return None
+    o1, o2, o3, o4 = st.columns(4)
+    volumes = o1.selectbox("Volumes are", ["Per period (e.g. monthly)", "Cumulative per well"], key=f"{prefix}_vol")
+    pdates = o2.selectbox("Each date marks the period", ["End", "Start"], key=f"{prefix}_pd",
+                          disabled=volumes.startswith("Cum"))
+    oil_u = o3.selectbox("Oil and water unit", list(OIL_UNITS), key=f"{prefix}_ou")
+    gas_u = o4.selectbox("Gas unit", list(GAS_UNITS), index=1, key=f"{prefix}_gu")
+    o1, o2, o3 = st.columns(3)
+    group = o1.selectbox("Average pressure surveys by", list(GROUPS), key=f"{prefix}_grp")
+    dayfirst = o2.selectbox("Ambiguous dates are", ["day/month/year", "month/day/year"], key=f"{prefix}_df")
+    out = dict(prod=prod, pres=pres, fo=OIL_UNITS[oil_u], fg=GAS_UNITS[gas_u],
+               kw=dict(volumes="period" if volumes.startswith("Per") else "cumulative",
+                       period_dates=pdates.lower(), group=GROUPS[group], dayfirst=dayfirst.startswith("day")))
+    if single:
+        pi = o3.number_input("Initial pressure, psia (0 = first survey)", min_value=0.0, value=0.0, step=50.0,
+                             key=f"{prefix}_pi")
+        sub = prod
+        if "reservoir" in prod:
+            names = sorted(prod["reservoir"].dropna().astype(str).unique())
+            res = st.selectbox("Reservoir", names, key=f"{prefix}_res")
+            out["kw"]["reservoir"] = res
+            sub = prod[prod["reservoir"].astype(str) == res]
+        if "well" in sub:
+            names = sorted(sub["well"].dropna().astype(str).unique())
+            out["kw"]["wells"] = st.multiselect("Wells to include", names, default=names, key=f"{prefix}_wells")
+        out["kw"]["initial_pressure"] = pi or None
+    return out
+
+
+def history_to_table(h, kind, fo, fg):
+    """Convert a build_history result to the oil or gas table, with PVT from the correlations page."""
+    d = h.copy()
+    for c in ("Np", "Wp", "Winj"):
+        d[c] *= fo
+    for c in ("Gp", "Ginj"):
+        d[c] *= fg
+    note = ""
+    try:
+        tab = make_pvt().table(d.p)
+        if kind == "oil":
+            for c in ("Bo", "Rs", "Bg", "Bw"):
+                d[c] = tab[c].values
+            note = "Bo, Rs, Bg and Bw come from the PVT correlations page; replace them with lab values if you have them."
+        else:
+            d["Gp"], d["z"], d["Bw"] = d["Gp"] / 1000.0, tab.z.values, tab.Bw.values
+            ss.w_gas_T = float(ss.w_pvt_T)
+            note = "z and Bw come from the PVT correlations page, and the temperature was set to match it."
+    except ValueError:
+        if kind == "gas":
+            d["Gp"] = d["Gp"] / 1000.0
+        note = "PVT columns are empty: fill them in, or set up the PVT correlations page and use the fill button."
+    cols = OIL_COLS if kind == "oil" else GAS_COLS
+    for c in cols:
+        if c not in d:
+            d[c] = np.nan
+    return d[cols], note
+
+
+def data_tools(name, columns, samples, kind):
+    """Bring data into a single-tank table: samples, a reservoir file, or per-well files."""
+    src = st.radio("Bring in data", ["Type in or use a sample", "By reservoir (one file)", "By well (two files)"],
+                   horizontal=True, key=f"w_{kind}_src")
+    if src.startswith("Type"):
+        cols = st.columns(len(samples) + 3)
+        for c, (label, df) in zip(cols, samples.items()):
+            if c.button(label, key=f"{name}_{label}"):
+                set_table(name, df.copy())
+                ss[f"{name}_note"] = ""
+                st.rerun()
+    elif src.startswith("By reservoir"):
+        up = st.file_uploader("Reservoir history (CSV or Excel)", type=FILE_TYPES, key=f"{name}_up")
+        st.caption("Columns: t (days) or date, then " + ", ".join(columns[1:]) + ". Cumulative volumes, first row "
+                   "initial conditions. Add a 'reservoir' column to keep several reservoirs in one file.")
+        if up is not None:
+            try:
+                raw = standardise_columns(read_any(up), extra=columns)
+                c1, c2 = st.columns(2)
+                res = None
+                if "reservoir" in raw:
+                    res = c1.selectbox("Reservoir", sorted(raw["reservoir"].dropna().astype(str).unique()),
+                                       key=f"{name}_res")
+                dayfirst = c2.selectbox("Ambiguous dates are", ["day/month/year", "month/day/year"],
+                                        key=f"{name}_rdf").startswith("day")
+                if st.button("Load into table", type="primary", key=f"{name}_load"):
+                    if "t" not in raw and "date" not in raw:
+                        raise ValueError("The file needs a 't' column (days) or a 'date' column.")
+                    tab = reservoir_table(raw, columns, res, dayfirst)
+                    set_table(name, tab)
+                    ss[f"{name}_note"] = f"Loaded {len(tab)} rows" + (f" for {res}." if res else ".")
+                    st.rerun()
+            except Exception as e:
+                st.error(f"Could not load the file: {e}")
+    else:
+        w = well_import(name)
+        if w is not None and st.button("Build table from wells", type="primary", key=f"{name}_build"):
+            try:
+                h = build_history(w["prod"], w["pres"], **w["kw"])
+                tab, note = history_to_table(h, kind, w["fo"], w["fg"])
+                set_table(name, tab)
+                n = len(w["kw"].get("wells") or []) or "all"
+                ss[f"{name}_note"] = " ".join([f"Built {len(tab)} rows from {n} wells."] + h.attrs["notes"] + [note])
+                st.rerun()
+            except (ValueError, KeyError) as e:
+                st.error(f"Could not build the table: {e}")
+    if ss.get(f"{name}_note"):
+        st.info(ss[f"{name}_note"])
+
+
+def mt_import():
+    """Load multi-tank production for every reservoir in a reservoir file or in well files."""
+    src = st.radio("Source", ["By reservoir (one file)", "By well (two files)"], horizontal=True, key="w_mt_src")
+    histories = None
+    try:
+        if src.startswith("By reservoir"):
+            up = st.file_uploader("Reservoir histories (CSV or Excel)", type=FILE_TYPES, key="mt_up")
+            st.caption("Columns: reservoir, t (days) or date, p, Np (MMSTB), Gp (MMscf), Wp (MMSTB). "
+                       "Each reservoir becomes a tank; its first row sets the initial pressure.")
+            if up is not None:
+                raw = standardise_columns(read_any(up), extra=["Np", "Gp", "Wp"])
+                dayfirst = st.selectbox("Ambiguous dates are", ["day/month/year", "month/day/year"],
+                                        key="mt_rdf").startswith("day")
+                if st.button("Load into tanks", type="primary", key="mt_load"):
+                    if "reservoir" not in raw:
+                        raw = raw.assign(reservoir="Reservoir")
+                    origin = None
+                    if "t" not in raw:
+                        origin = pd.to_datetime(raw["date"], format="mixed", dayfirst=dayfirst, errors="coerce").min()
+                    histories = {r: reservoir_table(raw, ["t", "p", "Np", "Gp", "Wp"], r, dayfirst, origin)
+                                 for r in sorted(raw["reservoir"].dropna().astype(str).unique())}
+        else:
+            w = well_import("mt", single=False)
+            if w is not None and st.button("Build tanks from wells", type="primary", key="mt_build"):
+                prod, kw = w["prod"], w["kw"]
+                if "reservoir" not in prod:
+                    prod = prod.assign(reservoir="Reservoir")
+                origin = common_origin(prod, w["pres"], kw["volumes"], kw["period_dates"], kw["dayfirst"])
+                histories = {}
+                for r in sorted(prod["reservoir"].dropna().astype(str).unique()):
+                    h = build_history(prod, w["pres"], reservoir=r, origin=origin, **kw)
+                    for c in ("Np", "Wp"):
+                        h[c] *= w["fo"]
+                    h["Gp"] *= w["fg"]
+                    histories[r] = h
+    except Exception as e:
+        st.error(f"Could not load the data: {e}")
+        return
+    if not histories:
+        return
+    old = ss.mt_tanks.set_index("name", drop=False) if len(ss.mt_tanks) else ss.mt_tanks
+    tanks, prod_rows = [], []
+    for r, h in histories.items():
+        h = h.dropna(subset=["t"]).reset_index(drop=True)
+        if h.empty:
+            continue
+        pi = float(h.p.dropna().iloc[0]) if h.p.notna().any() else 3000.0
+        row = (old.loc[r].to_dict() if r in old.index else
+               dict(name=r, fluid="oil", in_place=50.0, m=0.0, pi=pi, Swi=0.2, cf=4e-6, aquifer="none",
+                    C_or_B=np.nan, Wei=np.nan, J=np.nan, td_per_day=np.nan, reD=np.nan,
+                    fit_in_place=True, fit_aquifer=False))
+        row["pi"] = pi
+        tanks.append(row)
+        for _, x in h[h.t > 0].iterrows():
+            prod_rows.append(dict(tank=r, t=float(x.t), Np=x.Np, Gp=x.Gp, Wp=x.Wp, p_obs=x.p))
+    if not tanks:
+        st.error("No usable rows found.")
+        return
+    names = {t["name"] for t in tanks}
+    ss.mt_tanks = pd.DataFrame(tanks).reset_index(drop=True)
+    ss.mt_conns = ss.mt_conns[ss.mt_conns.a.isin(names) & ss.mt_conns.b.isin(names)].reset_index(drop=True)
+    ss.mt_prod = pd.DataFrame(prod_rows, columns=["tank", "t", "Np", "Gp", "Wp", "p_obs"]).astype(
+        {c: float for c in ("t", "Np", "Gp", "Wp", "p_obs")})
+    ss.mt_msg = (f"Loaded {len(tanks)} tank(s): {', '.join(sorted(names))}. New tanks start with a placeholder "
+                 "in-place volume of 50; set it, add connections, then run the history match.")
+    ss.ver += 1
+    st.rerun()
 
 
 def fig_ax(n=1, height=3.4):
@@ -259,7 +474,7 @@ def page_oil():
     st.caption("F = N·[Eo + m·Eg + Efw] + We.  The first row is initial conditions. "
                "Np, Wp, Winj in MMSTB; Gp, Ginj in MMscf; Bg in rb/scf.")
     with st.expander("Production & PVT history", expanded=True):
-        data_tools("oil_df", OIL_COLS, {"Gas-cap sample": OIL_GASCAP, "Water-drive sample": OIL_WATERDRIVE})
+        data_tools("oil_df", OIL_COLS, {"Gas-cap sample": OIL_GASCAP, "Water-drive sample": OIL_WATERDRIVE}, "oil")
         data = st.data_editor(ss.oil_df, num_rows="dynamic", width="stretch", key=f"oil_ed_{ss.ver}",
                               column_config={"Bg": st.column_config.NumberColumn(format="%.6f")})
         if st.button("Fill Bo, Rs, Bg, Bw from the PVT correlations page"):
@@ -330,7 +545,7 @@ def page_gas():
     st.caption("F = G·[Eg + Efw] + We and p/z = (pi/zi)·(1 − Gp/G).  The first row is initial conditions. "
                "Gp in Bscf, Wp in MMSTB.")
     with st.expander("Production history", expanded=True):
-        data_tools("gas_df", GAS_COLS, {"Load sample": GAS_SAMPLE})
+        data_tools("gas_df", GAS_COLS, {"Load sample": GAS_SAMPLE}, "gas")
         data = st.data_editor(ss.gas_df, num_rows="dynamic", width="stretch", key=f"gas_ed_{ss.ver}")
         if st.button("Fill z and Bw from the PVT correlations page"):
             try:
@@ -479,6 +694,8 @@ def page_multitank():
 
     st.caption("Each tank: F = N·Et + We + Σ T·∫(pj − pi)dt, solved for all pressures at every step. "
                "In place is MMSTB for oil tanks and Bscf for gas tanks; Gp is MMscf.")
+    with st.expander("Bring in production by reservoir or by well"):
+        mt_import()
     with st.expander("Tanks, connections and production", expanded=True):
         st.markdown("**Tanks**")
         tanks_df = st.data_editor(ss.mt_tanks, num_rows="dynamic", width="stretch", key=f"mt_t_{ss.ver}",

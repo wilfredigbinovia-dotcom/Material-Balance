@@ -10,6 +10,9 @@ Aquifer            aquifer description for the single-tank analyses
 oil_mbe, gas_mbe   Havlena-Odeh straight-line analysis (plus p/z for gas)
 Tank, Connection,
 MultiTank          connected-tank simulator with pressure history matching
+aggregate_wells,
+build_history      turn per-well production and pressure surveys into a reservoir history
+reservoir_table    pick one reservoir out of a multi-reservoir history file
 
 Units
 -----
@@ -32,7 +35,8 @@ from scipy.special import ive, kve
 
 __all__ = ["BlackOilPVT", "z_factor", "WD", "Aquifer", "veh_influx_function",
            "fetkovich_influx", "oil_mbe", "gas_mbe", "MBResult",
-           "Tank", "Connection", "MultiTank", "MTResult"]
+           "Tank", "Connection", "MultiTank", "MTResult",
+           "standardise_columns", "aggregate_wells", "build_history", "common_origin", "reservoir_table"]
 
 
 # =============================================================================
@@ -770,3 +774,223 @@ class MultiTank:
         return dict(rms_before=before, rms_after=after, runs=res.nfev,
                     fitted={f"{getattr(o, 'name', None) or o.a + ' -> ' + o.b}.{a}": getattr(o, a)
                             for o, a in L})
+
+
+# =============================================================================
+# Bringing in data by reservoir and by well
+# =============================================================================
+_ALIASES = {
+    "well": ("well", "well_name", "wellname", "well name", "uwi", "string"),
+    "reservoir": ("reservoir", "res", "zone", "sand", "tank"),
+    "date": ("date", "month", "period", "survey_date", "survey date"),
+    "t": ("t", "time", "days", "day"),
+    "oil": ("oil", "oil_volume", "oil volume", "oil_prod", "qo"),
+    "gas": ("gas", "gas_volume", "gas volume", "gas_prod", "qg"),
+    "water": ("water", "water_volume", "water volume", "water_prod", "qw"),
+    "winj": ("winj", "water_inj", "water injection", "water_injection"),
+    "ginj": ("ginj", "gas_inj", "gas injection", "gas_injection"),
+    "p": ("p", "pressure", "static_pressure", "static pressure", "reservoir_pressure",
+          "reservoir pressure", "pres"),
+}
+_VOLS = ["oil", "gas", "water", "winj", "ginj"]
+_CUMS = ["Np", "Gp", "Wp", "Winj", "Ginj"]
+
+
+def standardise_columns(df: pd.DataFrame, extra: Sequence[str] = ()) -> pd.DataFrame:
+    """Rename columns to the names this module expects, ignoring case and common variants."""
+    lookup = {a: k for k, names in _ALIASES.items() for a in names}
+    lookup.update({str(c).lower(): c for c in extra})
+    rename, used = {}, set()
+    for c in df.columns:
+        target = lookup.get(str(c).strip().lower())
+        if target is not None and target not in used:
+            rename[c] = target
+            used.add(target)
+    return df.rename(columns=rename)
+
+
+def _time_key(df, what):
+    if "date" in df:
+        return "date"
+    if "t" in df:
+        return "t"
+    raise ValueError(f"The {what} table needs a 'date' column or a 't' column (days).")
+
+
+def _to_dates(x, dayfirst):
+    """Parse dates: ISO (yyyy-mm-dd) first, otherwise day-first or month-first as told."""
+    x = pd.Series(x)
+    if pd.api.types.is_datetime64_any_dtype(x):
+        return x
+    try:
+        return pd.to_datetime(x, format="ISO8601")
+    except (ValueError, TypeError):
+        return pd.to_datetime(x.astype(str), format="mixed", dayfirst=dayfirst, errors="coerce")
+
+
+def _parse_time(df, key, dayfirst):
+    df = df.copy()
+    df[key] = (_to_dates(df[key], dayfirst) if key == "date"
+               else pd.to_numeric(df[key], errors="coerce"))
+    return df.dropna(subset=[key])
+
+
+def _days(x, base):
+    """Days from ``base`` for a datetime or numeric series."""
+    x = pd.Series(x)
+    if pd.api.types.is_datetime64_any_dtype(x):
+        return ((x - base) / pd.Timedelta(days=1)).to_numpy(dtype=float)
+    return (x - base).to_numpy(dtype=float)
+
+
+def _step(index):
+    d = pd.Series(index).diff().dropna()
+    if len(d) == 0:
+        return pd.Timedelta(days=30) if pd.api.types.is_datetime64_any_dtype(pd.Series(index)) else 30.0
+    return d.median()
+
+
+def aggregate_wells(production: pd.DataFrame, volumes: str = "period", period_dates: str = "end",
+                    reservoir=None, wells: Optional[Sequence] = None, dayfirst: bool = False) -> pd.DataFrame:
+    """Sum well production into reservoir cumulatives.
+
+    production   columns well, date (or t in days), oil, gas, water; optional reservoir, winj, ginj
+    volumes      'period' (volume produced in each period) or 'cumulative' (running total per well)
+    period_dates 'end' or 'start': which end of the period each date marks ('period' volumes only)
+    reservoir    keep only this reservoir (needs a 'reservoir' column)
+    wells        keep only these wells
+
+    Returns date (or t) and cumulative Np, Gp, Wp, Winj, Ginj in the units of the input.
+    """
+    df = standardise_columns(pd.DataFrame(production))
+    if reservoir is not None and "reservoir" in df:
+        df = df[df["reservoir"].astype(str) == str(reservoir)]
+    if "well" not in df:
+        df = df.assign(well="all")
+    if wells is not None:
+        df = df[df["well"].astype(str).isin([str(w) for w in wells])]
+    key = _time_key(df, "production")
+    df = _parse_time(df, key, dayfirst)
+    if df.empty:
+        raise ValueError("No production rows left after filtering by reservoir and wells.")
+    for c in _VOLS:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0) if c in df else 0.0
+    how = "sum" if volumes == "period" else "max"
+    wide = df.groupby(["well", key])[_VOLS].agg(how).unstack("well").sort_index()
+    wide = wide.fillna(0.0).cumsum() if volumes == "period" else wide.ffill().fillna(0.0)
+    cum = wide.T.groupby(level=0).sum().T[_VOLS]
+    if volumes == "period":
+        step, zero = _step(cum.index), pd.DataFrame([[0.0] * len(_VOLS)], columns=_VOLS)
+        if period_dates == "start":      # cumulative at a date excludes that period's volume
+            idx = list(cum.index) + [cum.index[-1] + step]
+        else:                            # production starts one period before the first date
+            idx = [cum.index[0] - step] + list(cum.index)
+        cum = pd.concat([zero, cum.reset_index(drop=True)], ignore_index=True)
+        cum.index = idx
+    out = cum.rename(columns=dict(zip(_VOLS, _CUMS))).rename_axis(key).reset_index()
+    return out
+
+
+def _surveys(pressures, reservoir, group, dayfirst, key):
+    ps = standardise_columns(pd.DataFrame(pressures))
+    if reservoir is not None and "reservoir" in ps:
+        ps = ps[ps["reservoir"].astype(str) == str(reservoir)]
+    if key not in ps or "p" not in ps:
+        raise ValueError(f"The pressure table needs '{key}' and 'pressure' columns, "
+                         "using the same kind of time column as the production table.")
+    ps = _parse_time(ps, key, dayfirst)
+    ps["p"] = pd.to_numeric(ps["p"], errors="coerce")
+    ps = ps.dropna(subset=["p"])
+    if ps.empty:
+        raise ValueError("No pressure surveys left after filtering.")
+    if group and key == "date":
+        ps = ps.groupby(ps["date"].dt.to_period(group)).agg(date=("date", "mean"), p=("p", "mean"))
+    else:
+        ps = ps.groupby(key, as_index=False)["p"].mean()
+    return ps.sort_values(key).reset_index(drop=True)
+
+
+def common_origin(production, pressures, volumes="period", period_dates="end", dayfirst=False):
+    """Earliest time across a production and a pressure table: the shared day 0 for several reservoirs."""
+    pr = standardise_columns(pd.DataFrame(production))
+    key = _time_key(pr, "production")
+    pr = _parse_time(pr, key, dayfirst)
+    ps = _parse_time(standardise_columns(pd.DataFrame(pressures)), key, dayfirst)
+    first = pr[key].min()
+    if volumes == "period" and period_dates == "end":
+        first = first - _step(np.sort(pr[key].unique()))
+    return min(first, ps[key].min())
+
+
+def build_history(production: pd.DataFrame, pressures: pd.DataFrame, volumes: str = "period",
+                  period_dates: str = "end", reservoir=None, wells: Optional[Sequence] = None,
+                  initial_pressure: Optional[float] = None, group: Optional[str] = None,
+                  dayfirst: bool = False, origin=None) -> pd.DataFrame:
+    """Reservoir history for material balance from per-well data.
+
+    Sums the wells (see ``aggregate_wells``), averages the pressure surveys taken on the same date
+    (or in the same month 'M', quarter 'Q' or year 'Y' if ``group`` is given) and interpolates the
+    cumulative volumes to each survey date.
+
+    pressures         columns date (or t), pressure; optional well, reservoir
+    initial_pressure  adds a first row at the start of production with zero volumes. Without it the
+                      first survey is taken as initial conditions.
+    origin            fixed day 0 (date or number). By default day 0 is the first row.
+
+    Returns t (days), p, Np, Gp, Wp, Winj, Ginj (+ date). Volumes keep the input units; add the PVT
+    columns before passing the table to ``oil_mbe`` or ``gas_mbe``. Any warnings are in ``.attrs['notes']``.
+    """
+    cum = aggregate_wells(production, volumes, period_dates, reservoir, wells, dayfirst)
+    key = "date" if "date" in cum else "t"
+    ps = _surveys(pressures, reservoir, group, dayfirst, key)
+    base = origin if origin is not None else min(cum[key].iloc[0], ps[key].iloc[0])
+    if key == "date":
+        base = pd.Timestamp(base)
+    tc, tp = _days(cum[key], base), _days(ps[key], base)
+    out = pd.DataFrame({"t": tp, "p": ps["p"].to_numpy(dtype=float)})
+    for c in _CUMS:
+        out[c] = np.interp(tp, tc, cum[c].to_numpy(dtype=float))
+    notes = []
+    if volumes == "period" and len(out) and len(tc) > 1 and out["t"].iloc[0] <= tc[0] + 0.1 * (tc[1] - tc[0]):
+        out.loc[out.index[0], _CUMS] = 0.0          # a survey at the very start of production is initial
+    if initial_pressure:
+        out = out[out["t"] > tc[0]]
+        first = {"t": tc[0], "p": float(initial_pressure), **{c: 0.0 for c in _CUMS}}
+        out = pd.concat([pd.DataFrame([first]), out], ignore_index=True)
+        if volumes == "cumulative" and cum[_CUMS].iloc[0].sum() > 0:
+            notes.append("The cumulative data does not start at zero, so the date of initial conditions "
+                         "is unknown; the initial row was placed at the first production record.")
+    elif out[["Np", "Gp", "Wp"]].iloc[0].sum() > 0:
+        notes.append("The first pressure survey was taken after production started, so the first row is "
+                     "not initial conditions. Give the initial reservoir pressure.")
+    if origin is None:
+        shift = out["t"].iloc[0]
+        out["t"] -= shift
+        if key == "date":
+            base = base + pd.Timedelta(days=float(shift))
+    if key == "date":
+        out["date"] = base + pd.to_timedelta(out["t"], unit="D")
+    out = out.reset_index(drop=True)
+    out.attrs["notes"] = notes
+    return out
+
+
+def reservoir_table(df: pd.DataFrame, columns: Sequence[str], reservoir=None, dayfirst: bool = False,
+                    origin=None) -> pd.DataFrame:
+    """One reservoir's history from a file that may hold several.
+
+    Filters on the 'reservoir' column, turns a 'date' column into t (days from the first row or from
+    ``origin``), sorts by time and returns ``columns`` (missing ones are left empty).
+    """
+    d = standardise_columns(pd.DataFrame(df), extra=columns)
+    if reservoir is not None and "reservoir" in d:
+        d = d[d["reservoir"].astype(str) == str(reservoir)]
+    d = d.copy()
+    if "t" not in d and "date" in d:
+        dates = _to_dates(d["date"], dayfirst)
+        d["t"] = _days(dates, pd.Timestamp(origin) if origin is not None else dates.min())
+    for c in columns:
+        d[c] = pd.to_numeric(d[c], errors="coerce") if c in d else np.nan
+    if d["t"].notna().any():
+        d = d.sort_values("t")
+    return d[list(columns)].reset_index(drop=True)

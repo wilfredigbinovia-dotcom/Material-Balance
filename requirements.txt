@@ -8,3 +8,4 @@ matplotlib>=3.5
 
 # app.py only
 streamlit>=1.50
+openpyxl>=3.0   # Excel uploads
