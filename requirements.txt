@@ -3,5 +3,8 @@ numpy>=1.22
 scipy>=1.8
 pandas>=1.4
 
-# examples.py only (charts)
+# app.py and examples.py (charts)
 matplotlib>=3.5
+
+# app.py only
+streamlit>=1.50

@@ -7,7 +7,7 @@ Reservoir material balance in Python, in field units.
 - **Multi-tank simulator** with transmissibility between tanks and pressure history matching
 - **PVT correlations** for black oil, gas and water
 
-Everything is in one file, `resmb.py`. `examples.py` runs five worked cases.
+The calculations are in one file, `resmb.py`. `app.py` is a Streamlit app on top of it, and `examples.py` runs five worked cases as a script.
 
 ## Install
 
@@ -20,7 +20,19 @@ python examples.py
 
 `examples.py` prints the results of each case and saves four charts as PNG files next to the script. It takes about ten seconds.
 
-Tested with Python 3.13, numpy 2.5, scipy 1.18, pandas 3.0 and matplotlib 3.11. The minimum versions in `requirements.txt` are not tested.
+Tested with Python 3.13, numpy 2.5, scipy 1.18, pandas 3.0, matplotlib 3.11 and streamlit 1.64. The minimum versions in `requirements.txt` are not tested.
+
+## Streamlit app
+
+```bash
+streamlit run app.py
+```
+
+Run `app.py`, not `resmb.py`: `resmb.py` is the library and shows nothing on its own. Keep both files in the same folder.
+
+The sidebar switches between four pages: Oil reservoir, Gas reservoir, Multi-tank and PVT correlations. Tables can be edited in place or loaded from a CSV, and results can be downloaded as CSV.
+
+To deploy on Streamlit Community Cloud, put `app.py`, `resmb.py` and `requirements.txt` in the root of a GitHub repository and set the main file to `app.py`.
 
 ## Units
 
@@ -175,5 +187,6 @@ print(match["rms_before"], match["rms_after"], match["fitted"])
 | File | Contents |
 |---|---|
 | `resmb.py` | The library |
+| `app.py` | Streamlit app |
 | `examples.py` | Five worked cases with charts |
 | `requirements.txt` | Dependencies |
