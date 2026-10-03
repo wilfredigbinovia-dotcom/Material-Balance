@@ -8,6 +8,8 @@ BlackOilPVT        PVT correlations (Standing / Vasquez-Beggs / Glaso, Beggs-Rob
 WD                 Van Everdingen-Hurst dimensionless water influx (Stehfest inversion)
 Aquifer            aquifer description for the single-tank analyses
 oil_mbe, gas_mbe   Havlena-Odeh straight-line analysis (plus p/z for gas)
+simulate_tank,
+analytical_match   run one tank forward in time and regress chosen parameters on measured pressure
 Tank, Connection,
 MultiTank          connected-tank simulator with pressure history matching
 aggregate_wells,
@@ -35,6 +37,7 @@ from scipy.special import ive, kve
 
 __all__ = ["BlackOilPVT", "z_factor", "WD", "Aquifer", "veh_influx_function",
            "fetkovich_influx", "oil_mbe", "gas_mbe", "MBResult",
+           "simulate_tank", "analytical_match", "MatchResult", "FIT_PARAMETERS",
            "Tank", "Connection", "MultiTank", "MTResult",
            "standardise_columns", "aggregate_wells", "build_history", "common_origin", "reservoir_table"]
 
@@ -287,6 +290,7 @@ class Aquifer:
     L: float = 0.0          # ft, linear aquifer length
     w: float = 0.0          # ft, linear aquifer width
     tune: bool = False
+    C: float = 0.0          # pot: rb/psi, steady: rb/(psi.day). Used by simulate_tank / analytical_match
 
     def constants(self, pi: float) -> dict:
         """Time constant, influx constant, water volume and productivity from rock properties."""
@@ -497,6 +501,274 @@ def gas_mbe(data: pd.DataFrame, temp_f: float, Swi: float, cw: float = 3e-6, cf:
     return MBResult(in_place=Gmm / 1000, r2=best["r2"], table=tab, aquifer=aq_info,
                     G_pz=-intercept / slope, pz_fit=(intercept, slope),
                     Gp_abandon=(pz_abandon - intercept) / slope if pz_abandon else np.nan)
+
+
+# =============================================================================
+# Analytical method: simulate one tank and regress on measured pressure
+# =============================================================================
+FIT_PARAMETERS = {
+    "in_place": "Oil or gas in place",
+    "m": "Gas cap ratio m",
+    "C": "Aquifer constant C (pot, steady)",
+    "reD": "Outer/inner radius ratio",
+    "ro": "Reservoir radius",
+    "theta": "Encroachment angle",
+    "h": "Aquifer thickness",
+    "phi": "Aquifer porosity",
+    "k": "Aquifer permeability",
+    "L": "Linear aquifer length",
+    "w": "Linear aquifer width",
+}
+
+
+def _extrap(x, xp, fp):
+    """Linear interpolation with linear extrapolation beyond both ends."""
+    if x < xp[0]:
+        return fp[0] + (fp[1] - fp[0]) * (x - xp[0]) / (xp[1] - xp[0])
+    if x > xp[-1]:
+        return fp[-1] + (fp[-1] - fp[-2]) * (x - xp[-1]) / (xp[-1] - xp[-2])
+    return float(np.interp(x, xp, fp))
+
+
+def _pvt_functions(d, fluid, temp_f, pvt):
+    """Return f(p) -> (Bo, Rs, Bg, Bw) and the lowest pressure it can be trusted at."""
+    if pvt is not None:
+        def f(p):
+            a = pvt.at(p)
+            return a["Bo"], a["Rs"], a["Bg"], a["Bw"]
+        return f, 50.0
+    p = d["p"]
+    order = np.argsort(p)
+    xp, idx = np.unique(p[order], return_index=True)
+    if len(xp) < 2:
+        raise ValueError("The table needs at least two different pressures to interpolate PVT.")
+    col = lambda c: d[c][order][idx]
+    if fluid == "gas":
+        if temp_f is None:
+            raise ValueError("temp_f is required for a gas tank.")
+        z, bw, TR = col("z"), col("Bw"), temp_f + 459.67
+
+        def f(p_):
+            return 0.0, 0.0, 0.005035 * max(_extrap(p_, xp, z), 0.05) * TR / p_, _extrap(p_, xp, bw)
+    else:
+        bo, rs, inv_bg, bw = col("Bo"), col("Rs"), 1.0 / col("Bg"), col("Bw")   # 1/Bg is near-linear in p
+
+        def f(p_):
+            return (_extrap(p_, xp, bo), max(_extrap(p_, xp, rs), 0.0),
+                    1.0 / max(_extrap(p_, xp, inv_bg), 1e-9), _extrap(p_, xp, bw))
+    return f, max(50.0, 0.3 * xp[0])
+
+
+def simulate_tank(data: pd.DataFrame, in_place: float, fluid: str = "oil", Swi: float = 0.2,
+                  cw: float = 3e-6, cf: float = 4e-6, m: float = 0.0, temp_f: Optional[float] = None,
+                  aquifer: Optional[Aquifer] = None, pvt: Optional[BlackOilPVT] = None) -> pd.DataFrame:
+    """Predict tank pressure at every row of the history from the production alone.
+
+    ``data`` is the same table as for ``oil_mbe`` / ``gas_mbe`` (row 0 = initial conditions). PVT is
+    interpolated from the table's own columns unless a ``BlackOilPVT`` is given. The aquifer is
+    described by its physical properties (or ``Aquifer.C`` for pot and steady-state models).
+
+    Returns t, p_obs, p_sim and We (MMrb). p_sim is NaN from the first row that cannot be solved.
+    """
+    from scipy.optimize import brentq
+    gas = fluid == "gas"
+    d = (_cols(data, ["p", "z", "Gp"], dict(t=0.0, Wp=0.0, Bw=1.0)) if gas else
+         _cols(data, ["p", "Np", "Gp", "Bo", "Rs", "Bg"], dict(t=0.0, Wp=0.0, Winj=0.0, Ginj=0.0, Bw=1.0)))
+    n, pi = len(d["p"]), float(d["p"][0])
+    t = d["t"] if np.all(np.diff(d["t"]) > 0) else np.arange(n, dtype=float)
+    props, p_low = _pvt_functions(d, fluid, temp_f, pvt)
+    Boi, Rsi, Bgi, _ = props(pi)
+    cfw = (cw * Swi + cf) / (1 - Swi)
+    model = aquifer.model if aquifer is not None else "none"
+    K = aquifer.constants(pi) if model in ("veh", "fetkovich") else None
+    if model == "fetkovich" and not np.isfinite(K["Wi"]):
+        raise ValueError("Fetkovich needs a finite aquifer (reD > 1).")
+    geo = aquifer.geometry if aquifer is not None else "radial"
+
+    P, WE, dPs = [pi], [0.0], []
+    S, We_prev, pa = 0.0, 0.0, pi                       # steady-state integral, Fetkovich state
+    for k in range(1, n):
+        dt, p_prev = t[k] - t[k - 1], P[-1]
+        if model == "veh":
+            s_known = float(np.dot(dPs, WD((t[k] - t[:k - 1]) * K["td"], geo, K["reD"]))) if k > 1 else 0.0
+            w_last, pm = WD(dt * K["td"], geo, K["reD"]), (P[0] if k == 1 else P[k - 2])
+
+        def influx(x):
+            if model == "pot":
+                return aquifer.C * (pi - x) / 1e6
+            if model == "steady":
+                return aquifer.C * (S + 0.5 * ((pi - p_prev) + (pi - x)) * dt) / 1e6
+            if model == "veh":
+                return K["B"] * (s_known + (pm - x) / 2 * w_last) / 1e6
+            if model == "fetkovich":
+                return We_prev + (K["Wei"] / pi) * (pa - (p_prev + x) / 2) * (
+                    1 - math.exp(-K["J"] * pi * dt / K["Wei"])) / 1e6
+            return 0.0
+
+        def resid(x):
+            Bo, Rs, Bg, Bw = props(x)
+            dp = pi - x
+            if gas:
+                F = d["Gp"][k] * 1000 * Bg + d["Wp"][k] * Bw
+                E = in_place * 1000 * ((Bg - Bgi) + Bgi * cfw * dp)
+            else:
+                F = (d["Np"][k] * Bo + (d["Gp"][k] - d["Np"][k] * Rs) * Bg
+                     + (d["Wp"][k] - d["Winj"][k]) * Bw - d["Ginj"][k] * Bg)
+                E = in_place * ((Bo - Boi) + (Rsi - Rs) * Bg + m * Boi * (Bg / Bgi - 1)
+                                + (1 + m) * Boi * cfw * dp)
+            return F - E - influx(x)
+
+        try:
+            lo, hi = p_low, 2.0 * pi
+            if resid(lo) * resid(hi) > 0:
+                break
+            x = brentq(resid, lo, hi, xtol=1e-3)
+        except (ValueError, ZeroDivisionError, OverflowError):
+            break
+        we = influx(x)
+        if model == "steady":
+            S += 0.5 * ((pi - p_prev) + (pi - x)) * dt
+        if model == "fetkovich":
+            We_prev, pa = we, pi * (1 - we * 1e6 / K["Wei"])
+        if model == "veh":
+            dPs.append((P[0] - x) / 2 if k == 1 else (P[k - 2] - x) / 2)
+        P.append(x)
+        WE.append(we)
+    pad = [np.nan] * (n - len(P))
+    return pd.DataFrame(dict(t=t, p_obs=d["p"], p_sim=P + pad, We=WE + pad))
+
+
+@dataclass
+class MatchResult:
+    """Result of analytical_match."""
+    start: dict
+    fitted: dict
+    rms_before: float
+    rms_after: float
+    table: pd.DataFrame            # t, p_obs, p_start, p_sim, We
+    in_place: float
+    m: float
+    aquifer: Optional[Aquifer]
+    warnings: list = field(default_factory=list)
+    success: bool = True
+    runs: int = 0
+
+    def __repr__(self):
+        fit = ", ".join(f"{k}={v:.5g}" for k, v in self.fitted.items())
+        return f"MatchResult(rms {self.rms_before:.1f} -> {self.rms_after:.1f} psi, {fit})"
+
+
+def _lumped(aq: Aquifer, pi: float):
+    """The lumped constants the aquifer response actually depends on."""
+    if aq.model in ("pot", "steady"):
+        return [aq.C]
+    K = aq.constants(pi)
+    if aq.model == "veh":
+        return [K["B"], K["td"]] + ([K["reD"]] if aq.geometry == "radial" and np.isfinite(K["reD"]) else [])
+    return [K["Wei"], K["J"]]
+
+
+def _redundancy(aq, names, pi):
+    """Number of independent aquifer parameters among ``names`` (rank of d ln(lumped) / d ln(param))."""
+    from dataclasses import replace
+    base = np.log(np.abs(_lumped(aq, pi)))
+    J = []
+    for nme in names:
+        up = replace(aq, **{nme: getattr(aq, nme) * 1.01})
+        J.append((np.log(np.abs(_lumped(up, pi))) - base) / math.log(1.01))
+    return int(np.linalg.matrix_rank(np.array(J), tol=1e-6)) if J else 0
+
+
+def analytical_match(data: pd.DataFrame, in_place: float, fit: Sequence[str] = ("in_place",),
+                     fluid: str = "oil", Swi: float = 0.2, cw: float = 3e-6, cf: float = 4e-6,
+                     m: float = 0.0, temp_f: Optional[float] = None, aquifer: Optional[Aquifer] = None,
+                     pvt: Optional[BlackOilPVT] = None, max_runs: int = 300) -> MatchResult:
+    """Regress the chosen parameters so the simulated tank pressure matches the measured pressure.
+
+    ``fit`` lists what to regress on, from ``FIT_PARAMETERS``: 'in_place', 'm', and the aquifer
+    properties 'C', 'reD', 'ro', 'theta', 'h', 'phi', 'k', 'L', 'w'. ``in_place``, ``m`` and the
+    values in ``aquifer`` are the starting point; everything not listed stays fixed.
+
+    Several aquifer properties scale the response the same way (thickness and encroachment angle,
+    for example), so ticking them together gives a non-unique answer. That is reported in
+    ``.warnings`` rather than refused.
+    """
+    from dataclasses import replace
+    from scipy.optimize import least_squares
+    fit = list(dict.fromkeys(fit))
+    unknown = [f for f in fit if f not in FIT_PARAMETERS]
+    if unknown:
+        raise ValueError(f"Unknown fit parameters: {unknown}")
+    model = aquifer.model if aquifer is not None else "none"
+    allowed = {"none": [], "pot": ["C"], "steady": ["C"]}.get(
+        model, ["L", "w", "h", "phi", "k"] if aquifer is not None and aquifer.geometry == "linear"
+        else ["reD", "ro", "theta", "h", "phi", "k"])
+    bad = [f for f in fit if f not in ("in_place", "m") and f not in allowed]
+    if bad:
+        raise ValueError(f"These parameters do not apply to the chosen aquifer model: {bad}")
+    if "m" in fit and fluid == "gas":
+        raise ValueError("m applies to oil tanks only.")
+    if not fit:
+        raise ValueError("Choose at least one parameter to regress on.")
+    aq0 = replace(aquifer) if aquifer is not None else None
+    if aq0 is not None and "reD" in fit and not np.isfinite(aq0.reD):
+        aq0.reD = 10.0                                   # an infinite aquifer cannot be a starting point
+    start = {f: (in_place if f == "in_place" else m if f == "m" else float(getattr(aq0, f))) for f in fit}
+    for f, v in start.items():
+        if f != "m" and not v > 0:
+            raise ValueError(f"The starting value for {FIT_PARAMETERS[f]} must be positive.")
+
+    # transforms: log for positive quantities, log(reD - 1) keeps the ratio above 1, m stays linear
+    enc = {f: (lambda v: v) if f == "m" else (lambda v: math.log(v - 1)) if f == "reD" else math.log for f in fit}
+    dec = {f: (lambda x: x) if f == "m" else (lambda x: 1 + math.exp(x)) if f == "reD" else math.exp for f in fit}
+    lo = [0.0 if f == "m" else math.log(0.05) if f == "reD" else -np.inf for f in fit]
+    hi = [20.0 if f == "m" else math.log(360.0) if f == "theta" else math.log(0.6) if f == "phi"
+          else math.log(500.0) if f == "reD" else np.inf for f in fit]
+    x0 = np.clip([enc[f](start[f]) for f in fit], lo, hi)
+    p_obs = _cols(data, ["p"], {})["p"]
+
+    def unpack(x):
+        vals = {f: dec[f](xi) for f, xi in zip(fit, x)}
+        aq = replace(aq0, **{f: v for f, v in vals.items() if f not in ("in_place", "m")}) if aq0 else None
+        return vals, vals.get("in_place", in_place), vals.get("m", m), aq
+
+    def run(x):
+        _, N_, m_, aq = unpack(x)
+        return simulate_tank(data, N_, fluid, Swi, cw, cf, m_, temp_f, aq, pvt)
+
+    def resid(x):
+        try:
+            sim = run(x)["p_sim"].to_numpy()[1:]
+        except (ValueError, ZeroDivisionError, OverflowError):
+            return np.full(len(p_obs) - 1, 1e4)
+        return np.where(np.isfinite(sim), sim - p_obs[1:], 1e4)
+
+    rms = lambda r: float(np.sqrt(np.mean(r ** 2)))
+    r0 = resid(x0)
+    if len(r0) < len(fit):
+        raise ValueError(f"{len(fit)} parameters need at least {len(fit)} rows after the initial row.")
+    sol = least_squares(resid, x0, bounds=(lo, hi), method="trf", diff_step=1e-3, max_nfev=max_runs)
+    x = sol.x if rms(sol.fun) <= rms(r0) else x0
+    fitted, N_, m_, aq = unpack(x)
+    first, final = run(x0), run(x)
+    table = final.rename(columns={"p_sim": "p_sim"}).assign(p_start=first["p_sim"])[
+        ["t", "p_obs", "p_start", "p_sim", "We"]]
+
+    notes = []
+    aq_names = [f for f in fit if f not in ("in_place", "m")]
+    if aq is not None and len(aq_names) > 1:
+        rank = _redundancy(aq, aq_names, float(p_obs[0]))
+        if rank < len(aq_names):
+            notes.append(f"{len(aq_names)} aquifer parameters were regressed but they only change the aquifer "
+                         f"response in {rank} independent way(s), so their individual values are not unique. "
+                         "Fix the ones you know.")
+    if not np.all(np.isfinite(final["p_sim"])):
+        notes.append("The tank could not be solved at every row with the matched values.")
+    for f, b_lo, b_hi, xi in zip(fit, lo, hi, x):
+        if (np.isfinite(b_hi) and xi >= b_hi - 1e-6) or (np.isfinite(b_lo) and xi <= b_lo + 1e-6):
+            notes.append(f"{FIT_PARAMETERS[f]} stopped at its limit ({fitted[f]:.4g}).")
+    return MatchResult(start=start, fitted=fitted, rms_before=rms(r0), rms_after=rms(resid(x)), table=table,
+                       in_place=N_, m=m_, aquifer=aq, warnings=notes, success=bool(sol.success), runs=int(sol.nfev))
 
 
 # =============================================================================

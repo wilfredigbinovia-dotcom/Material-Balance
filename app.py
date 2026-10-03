@@ -12,8 +12,11 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from resmb import (Aquifer, BlackOilPVT, Connection, MultiTank, Tank, build_history, common_origin,
-                   gas_mbe, oil_mbe, reservoir_table, standardise_columns)
+from dataclasses import replace
+
+from resmb import (FIT_PARAMETERS, Aquifer, BlackOilPVT, Connection, MultiTank, Tank, analytical_match,
+                   build_history, common_origin, gas_mbe, oil_mbe, reservoir_table, simulate_tank,
+                   standardise_columns)
 
 st.set_page_config(page_title="Reservoir Material Balance", layout="wide")
 
@@ -89,8 +92,10 @@ DEFAULTS = {
     "w_pvt_api": 35.0, "w_pvt_gg": 0.75, "w_pvt_T": 200.0, "w_pvt_known": "Rsb", "w_pvt_rsb": 600.0,
     "w_pvt_pb": 2500.0, "w_pvt_corr": "standing", "w_pvt_pmin": 200.0, "w_pvt_pmax": 4000.0,
     "w_pvt_step": 200.0, "w_mt_dt": 30.0, "w_mt_cw": 3e-6,
+    **{f"w_{p}_{k}": v for p in ("oil", "gas") for k, v in dict(
+        N0=0.0, C0=0.0, method="Graphical (straight line)", pvtsrc="Table columns").items()},
     "w_oil_src": "Type in or use a sample", "w_gas_src": "Type in or use a sample",
-    "w_mt_src": "By reservoir (one file)",
+    "w_mt_src": "By reservoir (one history file)",
     **{f"w_{p}_aq_{k}": v for p in ("oil", "gas") for k, v in AQ_DEFAULTS.items()},
 }
 ss = st.session_state
@@ -313,7 +318,7 @@ def history_to_table(h, kind, fo, fg):
 
 def data_tools(name, columns, samples, kind):
     """Bring data into a single-tank table: samples, a reservoir file, or per-well files."""
-    src = st.radio("Bring in data", ["Type in or use a sample", "By reservoir (one file)", "By well (two files)"],
+    src = st.radio("Bring in data", ["Type in or use a sample", "By reservoir (one history file)", "By well (production + pressure files)"],
                    horizontal=True, key=f"w_{kind}_src")
     if src.startswith("Type"):
         cols = st.columns(len(samples) + 3)
@@ -363,7 +368,7 @@ def data_tools(name, columns, samples, kind):
 
 def mt_import():
     """Load multi-tank production for every reservoir in a reservoir file or in well files."""
-    src = st.radio("Source", ["By reservoir (one file)", "By well (two files)"], horizontal=True, key="w_mt_src")
+    src = st.radio("Source", ["By reservoir (one history file)", "By well (production + pressure files)"], horizontal=True, key="w_mt_src")
     histories = None
     try:
         if src.startswith("By reservoir"):
@@ -460,6 +465,113 @@ def drive_index_chart(tab, parts):
 # -----------------------------------------------------------------------------
 # Pages
 # -----------------------------------------------------------------------------
+def apply_match(kind):
+    """Button callback: copy the matched values into the inputs."""
+    mt = ss.pop(f"{kind}_match", None)
+    if mt is None:
+        return
+    for f, v in mt["result"].fitted.items():
+        v = float(f"{v:.5g}")
+        key = {"in_place": f"w_{kind}_N0", "m": "w_oil_m", "C": f"w_{kind}_C0"}.get(f, f"w_{kind}_aq_{f}")
+        ss[key] = v
+
+
+def analytical_section(kind, data, aq, r):
+    """MBAL-style analytical method: simulate tank pressure and regress ticked parameters on it."""
+    gas = kind == "gas"
+    unit, fluid_name = ("Bscf", "Gas") if gas else ("MMSTB", "Oil")
+    nk, ck = f"w_{kind}_N0", f"w_{kind}_C0"
+    model = aq.model if aq is not None else "none"
+    geo = aq.geometry if aq is not None else "radial"
+    if not ss[nk] and r is not None:                       # start from the graphical answer
+        ss[nk] = float(f"{r.in_place:.4g}")
+    if model in ("pot", "steady") and not ss[ck] and r is not None and r.aquifer.get("C", 0) > 0:
+        ss[ck] = float(f"{r.aquifer['C']:.4g}")
+    st.caption("Predicts the tank pressure at each survey from the production history, then adjusts the chosen "
+               "parameters until predicted and measured pressures agree. Aquifer properties in the sidebar are "
+               "the starting values.")
+    c1, c2, c3 = st.columns(3)
+    c1.number_input(f"{fluid_name} in place, {unit} (start)", key=nk, min_value=0.0, step=1.0)
+    if model in ("pot", "steady"):
+        c2.number_input("Aquifer constant C, " + ("rb/psi" if model == "pot" else "rb/(psi·day)") + " (start)",
+                        key=ck, min_value=0.0, step=10.0)
+        aq = replace(aq, C=ss[ck])
+    c3.radio("PVT for the simulation", ["Table columns", "PVT correlations page"], key=f"w_{kind}_pvtsrc",
+             horizontal=True)
+    options = ["in_place"] + ([] if gas else ["m"]) + (
+        ["C"] if model in ("pot", "steady") else [] if model == "none" else
+        ["L", "w", "h", "phi", "k"] if geo == "linear" else ["reD", "ro", "theta", "h", "phi", "k"])
+    default = ["in_place"] + (["C"] if model in ("pot", "steady") else ["k"] if model != "none" else [])
+    label = lambda f: f"{fluid_name} in place" if f == "in_place" else FIT_PARAMETERS[f]
+    fit = st.multiselect("Regress on", options, default=default, format_func=label, key=f"{kind}_fit_{model}_{geo}")
+    if not ss[nk] > 0:
+        st.warning(f"Enter a starting {fluid_name.lower()} in place.")
+        return
+    try:
+        pvt = make_pvt() if ss[f"w_{kind}_pvtsrc"].startswith("PVT") else None
+        args = dict(fluid=kind, Swi=ss[f"w_{kind}_Swi"], cw=ss[f"w_{kind}_cw"], cf=ss[f"w_{kind}_cf"],
+                    m=0.0 if gas else ss.w_oil_m, temp_f=ss.w_gas_T if gas else None, aquifer=aq, pvt=pvt)
+        sim = simulate_tank(data, ss[nk], **args)
+    except (ValueError, KeyError) as e:
+        st.error(str(e))
+        return
+    sig = (model, geo, len(data), ss[f"w_{kind}_pvtsrc"])
+    if st.button("Run regression", type="primary", key=f"{kind}_regress"):
+        try:
+            with st.spinner("Matching measured pressures…"):
+                ss[f"{kind}_match"] = dict(result=analytical_match(data, ss[nk], fit=fit, **args), sig=sig)
+        except ValueError as e:
+            st.error(str(e))
+    mt = ss.get(f"{kind}_match")
+    if mt is not None and mt["sig"] != sig:
+        mt = None
+    res = mt["result"] if mt else None
+
+    err = (sim.p_sim - sim.p_obs).iloc[1:]
+    rms_now = float(np.sqrt((err ** 2).mean())) if err.notna().all() else float("nan")
+    items = [("RMS error, current inputs", f"{rms_now:,.1f} psi" if math.isfinite(rms_now) else "not solvable", None)]
+    if res:
+        items += [("RMS error, matched", f"{res.rms_after:,.1f} psi", f"{res.runs} simulation runs"),
+                  (f"Matched {fluid_name.lower()} in place", f"{res.in_place:,.2f} {unit}", None)]
+    show_metrics(items)
+    if not math.isfinite(rms_now):
+        st.warning("With the current inputs the tank cannot support the production at every row "
+                   "(dashed line stops early). Increase the in-place volume or the aquifer.")
+    if res:
+        st.dataframe(pd.DataFrame([dict(Parameter=label(f), Start=res.start[f], Matched=v)
+                                   for f, v in res.fitted.items()]), hide_index=True, width="stretch")
+        for wmsg in res.warnings:
+            st.warning(wmsg)
+        b1, b2, _ = st.columns([1.4, 1, 4])
+        b1.button("Use matched values as inputs", on_click=apply_match, args=(kind,), key=f"{kind}_apply")
+        if b2.button("Discard", key=f"{kind}_discard"):
+            ss.pop(f"{kind}_match", None)
+            st.rerun()
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig, ax = fig_ax()
+        ax.plot(sim.t, sim.p_sim, color=GREY, lw=2, ls="--", label="Current inputs")
+        if res:
+            ax.plot(res.table.t, res.table.p_sim, color=ORANGE, lw=2, label="Matched")
+        ax.plot(sim.t, sim.p_obs, "o", color=BLUE, mec="white", ms=7, label="Measured")
+        ax.set(title="Tank pressure", xlabel="Time, days", ylabel="Pressure, psia")
+        ax.legend(frameon=False)
+        show(fig)
+    with c2:
+        fig, ax = fig_ax()
+        ax.plot(sim.t, sim.We, color=GREY, lw=2, ls="--", label="Current inputs")
+        if res:
+            ax.plot(res.table.t, res.table.We, color=ORANGE, lw=2, label="Matched")
+        ax.set(title="Cumulative water influx", xlabel="Time, days", ylabel="We, MMrb")
+        ax.legend(frameon=False)
+        show(fig)
+    out = res.table if res else sim
+    st.dataframe(out, hide_index=True, width="stretch")
+    st.download_button("Download simulation as CSV", out.to_csv(index=False), f"{kind}_analytical_match.csv",
+                       "text/csv", key=f"{kind}_amdl")
+
+
 def page_oil():
     with st.sidebar:
         st.subheader("Rock & fluid")
@@ -488,11 +600,19 @@ def page_oil():
     if len(data) < 3:
         st.warning("Enter the initial row and at least two survey rows.")
         return
+    method = st.radio("Method", ["Graphical (straight line)", "Analytical (pressure match)"], horizontal=True,
+                      key="w_oil_method")
+    r, err = None, ""
     try:
         r = oil_mbe(data, Swi=ss.w_oil_Swi, cw=ss.w_oil_cw, cf=ss.w_oil_cf, m=ss.w_oil_m,
                     fit_m=ss.w_oil_fitm, aquifer=aq)
     except (ValueError, np.linalg.LinAlgError) as e:
-        st.error(str(e))
+        err = str(e)
+    if method.startswith("Analytical"):
+        analytical_section("oil", data, aq, r)
+        return
+    if r is None:
+        st.error(err)
         return
     if (data.p[1:] >= data.p[0]).any():
         st.warning("One or more survey pressures are at or above initial pressure; those rows distort the fit.")
@@ -565,11 +685,19 @@ def page_gas():
     if not (data.z > 0).all():
         st.error("Every row needs a z-factor.")
         return
+    method = st.radio("Method", ["Graphical (straight line)", "Analytical (pressure match)"], horizontal=True,
+                      key="w_gas_method")
+    r, err = None, ""
     try:
         r = gas_mbe(data, temp_f=ss.w_gas_T, Swi=ss.w_gas_Swi, cw=ss.w_gas_cw, cf=ss.w_gas_cf,
                     aquifer=aq, pz_abandon=ss.w_gas_pza or None)
     except (ValueError, np.linalg.LinAlgError) as e:
-        st.error(str(e))
+        err = str(e)
+    if method.startswith("Analytical"):
+        analytical_section("gas", data, aq, r)
+        return
+    if r is None:
+        st.error(err)
         return
     Gp_last = float(data.Gp.fillna(0).iloc[-1])
     ref = r.in_place if r.aquifer else r.G_pz

@@ -37,8 +37,8 @@ The sidebar switches between four pages: Oil reservoir, Gas reservoir, Multi-tan
 The Oil and Gas pages offer three ways to fill the history table:
 
 - **Type in or use a sample.**
-- **By reservoir (one file).** A CSV or Excel file with `t` (days) or `date`, then the table's columns (`p, Np, Gp, ...`), cumulative, first row initial conditions. Add a `reservoir` column to keep several reservoirs in one file and pick one in the app.
-- **By well (two files).** A production file and a pressure survey file. The app sums the wells, averages the surveys and interpolates the cumulatives to each survey date.
+- **By reservoir (one history file).** A CSV or Excel file with `t` (days) or `date`, then the table's columns (`p, Np, Gp, ...`), cumulative, first row initial conditions. Add a `reservoir` column to keep several reservoirs in one file and pick one in the app.
+- **By well (production + pressure files).** One production file covering all the wells, however many there are, and one pressure survey file. The app sums the wells, averages the surveys and interpolates the cumulatives to each survey date.
 
 | File | Columns | Optional |
 |---|---|---|
@@ -120,6 +120,44 @@ print(result.aquifer)    # B, td_per_day, implied_k, ...
 Geometry is `"radial"` (`ro`, `reD`, `theta`; leave `reD` at its default for an infinite aquifer) or `"linear"` (`L`, `w`, closed outer end).
 
 `Aquifer.constants(pi)` returns the time constant, influx constant, water volume and productivity implied by the rock properties. `WD(tD, geometry, reD)` gives the Van Everdingen–Hurst dimensionless influx on its own.
+
+## Analytical history match
+
+The straight-line method above fits the material balance terms. The analytical method, as in commercial material balance packages, instead predicts the tank pressure at each survey from the production history and regresses the parameters you choose until predicted and measured pressures agree.
+
+```python
+from resmb import Aquifer, analytical_match, simulate_tank
+
+aq = Aquifer(model="veh", geometry="radial", k=50, phi=0.2, mu_w=0.4, ct=7e-6,
+             h=60, ro=4000, reD=8, theta=180)                 # starting values
+match = analytical_match(data, in_place=150, fit=["in_place", "k"],
+                         fluid="oil", Swi=0.2, cw=3e-6, cf=4e-6, m=0.0, aquifer=aq)
+print(match.rms_before, match.rms_after)   # psi
+print(match.fitted)                        # {'in_place': ..., 'k': ...}
+print(match.warnings)
+print(match.table)                         # t, p_obs, p_start, p_sim, We
+
+sim = simulate_tank(data, in_place=100, aquifer=match.aquifer)   # prediction only, no regression
+```
+
+| `fit` name | Parameter | Applies to |
+|---|---|---|
+| `in_place` | Oil or gas in place | always |
+| `m` | Gas cap ratio | oil |
+| `C` | Aquifer constant | pot, steady |
+| `reD` | Outer/inner radius ratio | radial veh, fetkovich |
+| `ro` | Reservoir radius | radial |
+| `theta` | Encroachment angle | radial |
+| `h` | Aquifer thickness | veh, fetkovich |
+| `phi` | Aquifer porosity | veh, fetkovich |
+| `k` | Aquifer permeability | veh, fetkovich |
+| `L`, `w` | Linear aquifer length and width | linear |
+
+Anything not listed in `fit` stays fixed at the value you gave. For a gas tank pass `fluid="gas"` and `temp_f`. PVT is interpolated from the table's own columns unless you pass `pvt=BlackOilPVT(...)`.
+
+Several aquifer properties change the response in the same way: thickness and encroachment angle only scale its strength, for instance. Regressing on them together fits the pressures but their individual values are not unique; `match.warnings` says when that happens.
+
+In the Streamlit app, choose **Analytical (pressure match)** under Method on the Oil or Gas page.
 
 ## Gas reservoir
 
