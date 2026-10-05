@@ -19,7 +19,25 @@ The app opens in your browser with a synthetic sample case loaded
    Cole (F-We)/Et, Roach, Cole F/Et), analytical plot (pressure vs cumulative production), energy plot, WD function plot.
 5. **Aquifer** - automatic detection of an extra energy source, then model (small pot, Schilthuis, Hurst-van Everdingen,
    Carter-Tracy, Fetkovich) and system (radial, linear, bottom drive).
-6. **Regression** - least-squares match of model pressure to history on any ticked parameters.
+6. **Regression** - survey screening, then a least-squares or robust match of model pressure to
+   history on any ticked parameters.
+
+### Pressure survey screening
+
+Each survey has a **Use** tick box and a **Weight** (tab 2). A survey that is switched off keeps its
+production record but its pressure is ignored in the regression, the RMS, the graphical fits and the
+aquifer detection, and is drawn hollow on the plots. Tab 6 scores the surveys so you can decide:
+
+* **Trend screen (no model)** - each pressure is compared with a Theil-Sen line through its three
+  neighbours on each side of the p versus Gp trend; the worst is set aside and the screen repeated.
+* **Residual screen** - each pressure is compared with the model; scatter comes from the median
+  absolute deviation, which outliers cannot inflate.
+* **Runs test** - warns when the residuals are one-sided for long stretches, which is model error
+  and must not be "fixed" by switching surveys off.
+* **Robust fitting (soft-L1)** - down-weights isolated bad surveys without removing them.
+* **Influence check** - refits with each survey left out and reports how far the answer moves.
+
+The sample case contains two deliberately bad surveys (160 and 180 psi high).
 
 Units switch between Field and SI in the sidebar. Projects save to and load from a JSON file.
 
@@ -46,7 +64,8 @@ G is the wet (well-stream) gas initially in place.
     mbal/pvt.py       PVT correlations and table handling
     mbal/aquifer.py   aquifer models
     mbal/matbal.py    material balance, graphical methods, drive detection
-    mbal/regress.py   regression
+    mbal/regress.py   regression (weights, robust loss, leave-one-out)
+    mbal/outliers.py  survey screening statistics
     mbal/model.py     configuration -> engine objects
     mbal/sample.py    synthetic sample case
     tests/            engine checks:  python tests/test_engine.py

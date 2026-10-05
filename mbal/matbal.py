@@ -24,16 +24,33 @@ class History:
     gp: np.ndarray   # scf separator gas
     np_: np.ndarray  # STB condensate
     wp: np.ndarray   # STB water
+    use: np.ndarray = None   # bool, pressure survey switched on
+    w: np.ndarray = None     # relative weight of each pressure survey
+
+    def __post_init__(self):
+        n = len(self.t)
+        self.use = np.ones(n, bool) if self.use is None else np.asarray(self.use, bool)
+        self.w = np.ones(n) if self.w is None else np.asarray(self.w, float)
+        self.w_in = np.maximum(np.nan_to_num(self.w, nan=1.0), 0.0)   # as entered
+        self.w = np.where(self.use, np.maximum(self.w, 0.0), 0.0)
+        self.use = self.use & (self.w > 0)
+        self.use[0], self.w[0] = True, 1.0
 
 
 def build_history(df, start_date, pi):
-    """df columns: date, p, gp [MMscf], np [MSTB], wp [MSTB] (cumulative). Prepends initial conditions."""
+    """df columns: date, p, gp [MMscf], np [MSTB], wp [MSTB] (cumulative), optional use, w.
+
+    Prepends initial conditions. A survey that is switched off keeps its production
+    record (the tank still needs it) but its pressure is ignored in every fit.
+    """
     import pandas as pd
     d = df.copy()
     d["date"] = pd.to_datetime(d["date"], errors="coerce")
     for c in ("gp", "np", "wp"):
         d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0.0)
     d["p"] = pd.to_numeric(d["p"], errors="coerce")
+    d["use"] = _flag(d["use"]) if "use" in d else True
+    d["w"] = pd.to_numeric(d["w"], errors="coerce").fillna(1.0) if "w" in d else 1.0
     d = d.dropna(subset=["date", "p"]).sort_values("date")
     t = (d["date"] - pd.Timestamp(start_date)).dt.total_seconds().to_numpy() / 86400.0
     keep = (t > 0) & (d["gp"].to_numpy() > 0)
@@ -48,7 +65,14 @@ def build_history(df, start_date, pi):
         gp=np.concatenate([z, d["gp"].to_numpy(float) * 1e6]),
         np_=np.concatenate([z, d["np"].to_numpy(float) * 1e3]),
         wp=np.concatenate([z, d["wp"].to_numpy(float) * 1e3]),
+        use=np.concatenate([[True], d["use"].to_numpy(bool)]),
+        w=np.concatenate([[1.0], d["w"].to_numpy(float)]),
     )
+
+
+def _flag(s):
+    """Tick-box column -> bool, treating blanks as switched on."""
+    return s.map(lambda v: True if v is None or (isinstance(v, float) and np.isnan(v)) else bool(v))
 
 
 def aggregate_wells(wells, pressures):
@@ -68,6 +92,9 @@ def aggregate_wells(wells, pressures):
     pr = pr.dropna(subset=["date", "p"]).sort_values("date")
     out = pd.DataFrame({"date": pr["date"].to_numpy(), "p": pr["p"].to_numpy(),
                         "gp": 0.0, "np": 0.0, "wp": 0.0})
+    out["use"] = _flag(pr["use"]).to_numpy() if "use" in pr else True
+    out["w"] = (pd.to_numeric(pr["w"], errors="coerce").fillna(1.0).to_numpy()
+                if "w" in pr else 1.0)
     x = pr["date"].astype("int64").to_numpy(float)
     for _, g in w.groupby("well"):
         g = g.sort_values("date")
@@ -89,6 +116,10 @@ class Tank:
         self.bgi = float(pvt.bg(pi))
         self.zi = float(pvt.z(pi))
         self.ce = (cw * swi + cf) / (1.0 - swi)
+        self.use, self.w = hist.use, hist.w
+        # Pressures that drive the aquifer: switched-off surveys are bridged by
+        # interpolating in time between their neighbours.
+        self.p_drive = np.interp(hist.t, hist.t[self.use], hist.p[self.use])
 
     # ---- MBE terms (vectorised on pressure)
     def Eg(self, p):
@@ -106,7 +137,7 @@ class Tank:
 
     def We_history(self):
         """Aquifer influx driven by the measured pressures."""
-        return self.aq.influx(self.h.t, self.h.p)
+        return self.aq.influx(self.h.t, self.p_drive)
 
     # ---- forward prediction of pressure from production
     def simulate(self):
@@ -145,7 +176,7 @@ class Tank:
 
     # ---- drive indices
     def energy(self):
-        p = self.h.p
+        p = self.p_drive
         we = self.We_history()
         a, b, c = self.G * self.Eg(p), self.G * self.Efw(p), np.maximum(we, 0.0)
         tot = a + b + c
@@ -184,7 +215,7 @@ def graphical(tank: Tank, method, sel=None):
     h, pv = tank.h, tank.pvt
     p = h.p
     n = len(p)
-    sel = np.ones(n, bool) if sel is None else np.asarray(sel, bool)
+    sel = (np.ones(n, bool) if sel is None else np.asarray(sel, bool)) & tank.use
     z = pv.z(p)
     pz, pzi = p / z, tank.pi / tank.zi
     dp = tank.pi - p
@@ -267,7 +298,8 @@ def detect_drive(tank: Tank, min_dp_frac=0.04):
     p = tank.h.p
     with np.errstate(divide="ignore", invalid="ignore"):
         y = tank.F() / tank.Et(p)
-    m = (np.arange(len(p)) > 0) & ((tank.pi - p) > min_dp_frac * tank.pi) & np.isfinite(y)
+    m = ((np.arange(len(p)) > 0) & ((tank.pi - p) > min_dp_frac * tank.pi) & np.isfinite(y)
+         & tank.use)
     res = {"status": "insufficient", "n": int(m.sum())}
     if m.sum() < 5:
         res["message"] = ("Not enough points with meaningful pressure depletion to diagnose the "

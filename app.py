@@ -17,23 +17,26 @@ from mbal.matbal import METHODS, aggregate_wells, build_history, detect_drive, g
 from mbal.model import PARAMS, aquifer_params, make_aquifer, make_tank
 from mbal.pvt import (PVT, condensate_props, correlation_table, gas_equivalent, hall_cf,
                       water_props, wet_gas_gravity)
-from mbal.regress import pressure_rms, regress
+from mbal.outliers import residual_screen, runs_test, trend_screen
+from mbal.regress import leave_one_out, pressure_rms, regress
 from mbal.sample import default_config, sample_case
 
 st.set_page_config(page_title="Condensate Material Balance", page_icon="🛢️", layout="wide")
 ss = st.session_state
 
 BLUE, ORANGE, AQUA, YELLOW, GREY = "#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#8a8a85"
+RED = "#e34948"
+SURVEY = [("use", "Use", "bool"), ("w", "Weight", "weight")]   # pressure survey on/off and weight
 
 TABLES = {  # name -> [(column, label, quantity or None)]
     "pvt": [("p", "Pressure", "pressure"), ("z", "Z-factor (two-phase below dew point)", None),
             ("cgr", "Producing CGR (optional)", "cgr")],
     "hist": [("date", "Date", "date"), ("p", "Reservoir pressure", "pressure"),
              ("gp", "Cum. gas", "gas_cum"), ("np", "Cum. condensate", "liq_cum"),
-             ("wp", "Cum. water", "liq_cum")],
+             ("wp", "Cum. water", "liq_cum")] + SURVEY,
     "wells": [("well", "Well", "text"), ("date", "Date", "date"), ("gp", "Cum. gas", "gas_cum"),
               ("np", "Cum. condensate", "liq_cum"), ("wp", "Cum. water", "liq_cum")],
-    "pres": [("date", "Date", "date"), ("p", "Reservoir pressure", "pressure")],
+    "pres": [("date", "Date", "date"), ("p", "Reservoir pressure", "pressure")] + SURVEY,
 }
 
 
@@ -41,7 +44,8 @@ TABLES = {  # name -> [(column, label, quantity or None)]
 def empty_table(name):
     d = {}
     for col, _, q in TABLES[name]:
-        d[col] = pd.Series(dtype="datetime64[ns]" if q == "date" else "object" if q == "text" else "float64")
+        d[col] = pd.Series(dtype="datetime64[ns]" if q == "date" else "object" if q == "text"
+                           else "bool" if q == "bool" else "float64")
     return pd.DataFrame(d)
 
 
@@ -126,14 +130,15 @@ with st.sidebar:
             st.error(f"Could not read that project file: {e}")
     st.divider()
     st.caption("Work through the tabs from left to right. The sample case is synthetic: "
-               "250 Bscf wet gas with a finite radial aquifer.")
+               "250 Bscf wet gas with a finite radial aquifer, and two deliberately bad "
+               "pressure surveys to try the screening on.")
 
 KEY = f"{SYS}_{ss.ver}"
 
 
 # ============================================================ widget helpers
 def ulabel(text, q):
-    if q in (None, "text", "date") or U.label(q, SYS) in ("-",):
+    if q in (None, "text", "date", "bool", "weight") or U.label(q, SYS) in ("-",):
         return text
     return f"{text} ({U.label(q, SYS)})"
 
@@ -166,19 +171,39 @@ def choice(label, key, options, where=st, horizontal=None, help=None):
     return v
 
 
+def as_flag(v):
+    """Tick-box / CSV value -> bool; blanks count as switched on."""
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return True
+    if isinstance(v, str):
+        return v.strip().lower() not in ("0", "false", "no", "n", "off", "")
+    return bool(v)
+
+
 def table(name, height=350):
     """Editable table shown in display units; ss.cur[name] always holds field units."""
     spec = TABLES[name]
     src = ss.tables[name]
-    disp, cfg = pd.DataFrame(), {}
+    disp, cfg = pd.DataFrame(index=src.index), {}
     for col, lab, q in spec:
-        s = src[col] if col in src else pd.Series(dtype="float64")
+        s = src[col] if col in src else pd.Series(np.nan, index=src.index, dtype="object")
         if q == "date":
             disp[col] = pd.to_datetime(s, errors="coerce")
             cfg[col] = st.column_config.DateColumn(lab, format="YYYY-MM-DD")
         elif q == "text":
             disp[col] = s.astype("object")
             cfg[col] = st.column_config.TextColumn(lab)
+        elif q == "bool":
+            disp[col] = s.map(as_flag).astype(bool)
+            cfg[col] = st.column_config.CheckboxColumn(
+                lab, default=True, help="Untick to switch this pressure survey off. Its production "
+                                        "is kept; its pressure is ignored in every fit.")
+        elif q == "weight":
+            disp[col] = pd.to_numeric(s, errors="coerce").astype(float).fillna(1.0)
+            cfg[col] = st.column_config.NumberColumn(
+                lab, default=1.0, min_value=0.0, format="%.3g",
+                help="Relative confidence in this survey for regression. 1 is normal; "
+                     "2 counts double; 0.5 counts half.")
         else:
             disp[col] = U.to_disp(q, pd.to_numeric(s, errors="coerce").astype(float), SYS)
             cfg[col] = st.column_config.NumberColumn(ulabel(lab, q), format="%.6g")
@@ -188,6 +213,10 @@ def table(name, height=350):
     for col, _, q in spec:
         if q in ("date", "text"):
             out[col] = ed[col]
+        elif q == "bool":
+            out[col] = ed[col].map(as_flag).astype(bool)
+        elif q == "weight":
+            out[col] = pd.to_numeric(ed[col], errors="coerce").astype(float).fillna(1.0).clip(lower=0.0)
         else:
             out[col] = U.from_disp(q, pd.to_numeric(ed[col], errors="coerce").astype(float), SYS)
     ss.cur[name] = out.reset_index(drop=True)
@@ -208,7 +237,12 @@ def csv_upload(name, note):
                 raw = raw.iloc[:, :len(spec)]
                 df = pd.DataFrame()
                 for i, (col, _, q) in enumerate(spec):
-                    if i >= raw.shape[1]:
+                    if q == "bool":
+                        df[col] = raw.iloc[:, i].map(as_flag) if i < raw.shape[1] else True
+                    elif q == "weight":
+                        df[col] = (pd.to_numeric(raw.iloc[:, i], errors="coerce").fillna(1.0)
+                                   if i < raw.shape[1] else 1.0)
+                    elif i >= raw.shape[1]:
                         df[col] = np.nan
                     elif q == "date":
                         df[col] = pd.to_datetime(raw.iloc[:, i], errors="coerce")
@@ -354,12 +388,13 @@ with t_prod:
         mode = choice("Enter production", "hist_mode",
                       {"By reservoir": "By reservoir", "By well": "By well"}, horizontal=True)
     st.caption("All volumes are cumulative. Gas is separator (dry) gas; the tool converts "
-               "condensate to its gas equivalent to obtain wet-gas production.")
+               "condensate to its gas equivalent to obtain wet-gas production. Untick **Use** to "
+               "switch a pressure survey off; tab 6 can suggest which ones to review.")
     if mode == "By reservoir":
         left, right = st.columns([3, 3])
         with left:
             hist_df = table("hist", height=460)
-            csv_upload("hist", "Dates as YYYY-MM-DD.")
+            csv_upload("hist", "Dates as YYYY-MM-DD. Use and Weight are optional.")
     else:
         left, right = st.columns([3, 3])
         with left:
@@ -368,7 +403,7 @@ with t_prod:
             csv_upload("wells", "Dates as YYYY-MM-DD.")
             st.markdown("**Average reservoir pressure surveys**")
             pres_df = table("pres", height=240)
-            csv_upload("pres", "Dates as YYYY-MM-DD.")
+            csv_upload("pres", "Dates as YYYY-MM-DD. Use and Weight are optional.")
         try:
             hist_df = aggregate_wells(wells_df, pres_df)
         except Exception as e:  # noqa: BLE001
@@ -385,8 +420,12 @@ with t_prod:
         if HIST_OK:
             dates = pd.Timestamp(V["start_date"]) + pd.to_timedelta(hist.t, unit="D")
             f = figure("", f"Reservoir pressure ({PU})", height=250, legend=False)
-            f.add_trace(go.Scatter(x=dates[1:], y=U.to_disp("pressure", hist.p[1:], SYS), mode="markers",
+            on_ = hist.use[1:]
+            py_ = U.to_disp("pressure", hist.p[1:], SYS)
+            f.add_trace(go.Scatter(x=dates[1:][on_], y=py_[on_], mode="markers",
                                    marker=dict(color=BLUE, size=8), name="Pressure"))
+            f.add_trace(go.Scatter(x=dates[1:][~on_], y=py_[~on_], mode="markers", name="Switched off",
+                                   marker=dict(color=GREY, size=8, symbol="circle-open")))
             show(f, "h_p")
             f = figure("", f"Cumulative gas ({U.label('gas_ip', SYS)})", height=250)
             f.add_trace(go.Scatter(x=dates, y=gas_ip(hist.gp), mode="lines",
@@ -471,6 +510,25 @@ if READY:
     tank0 = make_tank(V, pvt, hist, with_aquifer=False)
     DET = detect_drive(tank0)
     n_pts = len(hist.p)
+    DATES = pd.Timestamp(V["start_date"]) + pd.to_timedelta(hist.t, unit="D")
+    LAB = np.array([str(d.date()) for d in DATES])
+    N_ON = int(hist.use[1:].sum())
+
+
+def history_points(fig, x, y, flag=None, size=9):
+    """History markers: switched-on surveys solid, flagged ones crossed, switched-off hollow."""
+    x, y = np.asarray(x), np.asarray(y)
+    fl = np.zeros(len(y), bool) if flag is None else flag
+    on, off = hist.use & ~fl, ~hist.use & ~fl
+    fig.add_trace(go.Scatter(x=x[on], y=y[on], mode="markers", name="History", text=LAB[on],
+                             marker=dict(color=BLUE, size=size)))
+    if fl.any():
+        fig.add_trace(go.Scatter(x=x[fl], y=y[fl], mode="markers", name="Flagged", text=LAB[fl],
+                                 marker=dict(color=RED, size=size + 3, symbol="x")))
+    if off.any():
+        fig.add_trace(go.Scatter(x=x[off], y=y[off], mode="markers", name="Switched off",
+                                 text=LAB[off], marker=dict(color=GREY, size=size - 1,
+                                                            symbol="circle-open")))
 
 
 def need_data():
@@ -581,7 +639,7 @@ if READY:
     tank = make_tank(V, pvt, hist)
     P_SIM, WE_SIM = tank.simulate()
     WE_HIST = tank.We_history()
-    RMS = pressure_rms(P_SIM, hist.p)
+    RMS = pressure_rms(P_SIM, hist.p, hist.w)
     AQ = tank.aq
 
 with t_aq:
@@ -654,7 +712,7 @@ with t_hm:
                                      text=np.array(lab)[used], marker=dict(color=BLUE, size=9)))
             if unused.any():
                 fig.add_trace(go.Scatter(x=xs[unused], y=ys[unused], mode="markers",
-                                         name="History (excluded)", text=np.array(lab)[unused],
+                                         name="History (not in fit)", text=np.array(lab)[unused],
                                          marker=dict(color=GREY, size=8, symbol="circle-open")))
             fit = g["fit"]
             if g["kind"] == "flat" and g["G"] is not None and used.any():
@@ -728,14 +786,14 @@ with t_hm:
             fig.add_trace(go.Scatter(x=gas_ip(tank.gpw), y=U.to_disp("pressure", P_SIM, SYS), mode="lines",
                                      name="Model" + (f" ({MODELS[AQ.model]})" if AQ.active else " (no aquifer)"),
                                      line=dict(color=ORANGE, width=2)))
-            fig.add_trace(go.Scatter(x=gas_ip(tank.gpw), y=U.to_disp("pressure", hist.p, SYS),
-                                     mode="markers", name="History", text=lab,
-                                     marker=dict(color=BLUE, size=9)))
+            history_points(fig, gas_ip(tank.gpw), U.to_disp("pressure", hist.p, SYS))
             show(fig, "an")
             c = st.columns(4)
             c[0].metric(f"Pressure match RMS ({PU})",
-                        "n/a" if not np.isfinite(RMS) else f"{U.to_disp('pressure', RMS, SYS):,.1f}")
+                        "n/a" if not np.isfinite(RMS) else f"{U.to_disp('pressure', RMS, SYS):,.1f}",
+                        help="Weighted, over the surveys that are switched on.")
             c[1].metric("Model G", fmt_g(V["G"] * 1e9))
+            c[3].metric("Surveys switched on", f"{N_ON} of {n_pts - 1}")
             c[2].metric("Recovery to date (wet gas)", f"{tank.gpw[-1] / (V['G'] * 1e9):.1%}")
             if np.isnan(P_SIM).any():
                 st.error("The model cannot deliver the produced volumes with these parameters "
@@ -751,6 +809,7 @@ with t_hm:
                     f"History pressure ({PU})": np.round(U.to_disp("pressure", hist.p, SYS), 1),
                     f"Model pressure ({PU})": np.round(U.to_disp("pressure", P_SIM, SYS), 1),
                     f"Difference ({PU})": np.round((P_SIM - hist.p) * U.Q["pressure"][SYS][1], 1),
+                    "Survey used": hist.use,
                     f"Model water influx ({U.label('res_vol', SYS)})":
                         np.round(U.to_disp("res_vol", WE_SIM / 1e6, SYS), 3),
                 }), hide_index=True, width="stretch")
@@ -809,112 +868,298 @@ with t_hm:
                               if AQ.model == "fetkovich" else ""))
 
 # ============================================================ 6. Regression
+def set_surveys(upd):
+    """upd: {date: (use, weight)}. Writes to the table that holds the pressure surveys."""
+    name = "hist" if V["hist_mode"] == "By reservoir" else "pres"
+    df = ss.cur[name].copy()
+    d = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
+    for i, dd in d.items():
+        if dd in upd:
+            df.at[i, "use"], df.at[i, "w"] = bool(upd[dd][0]), float(upd[dd][1])
+    ss.cur[name] = df
+    refresh()
+
+
 with t_reg:
     if not READY:
         need_data()
     else:
-        st.subheader("Regress on parameters to match pressure history")
-        keys = ["G", "cf"] + aquifer_params(V["aq_model"], V["aq_geom"],
-                                            bool(V["aq_inf"]) and V["aq_model"] != "fetkovich")
-        default_on = {"G"} | set({"pot": ["aq_Wvol"], "schilthuis": ["aq_C"]}.get(
-            V["aq_model"], [k for k in keys if k in ("aq_reD", "aq_k", "aq_L")]))
-        rows = []
-        for k in keys:
-            lab_, q, lo_, hi_ = PARAMS[k]
-            cur_ = V[k]
-            a, b = max(cur_ * 0.2, lo_), min(cur_ * 5.0, hi_)
-            if k == "aq_reD":
-                a, b = 1.2, max(20.0, cur_ * 2)
-            if k == "aq_theta":
-                a, b = 10.0, 360.0
-            rows.append({"Regress": k in default_on, "Parameter": ulabel(lab_, q),
-                         "Current value": U.to_disp(q, cur_, SYS),
-                         "Minimum": U.to_disp(q, a, SYS), "Maximum": U.to_disp(q, b, SYS)})
-        left, right = st.columns([3, 3])
-        with left:
-            st.caption("Tick the parameters to adjust and set their limits. Regress on as few "
-                       "as needed: many aquifer parameters compensate for one another.")
-            ed = st.data_editor(
-                pd.DataFrame(rows), hide_index=True, width="stretch",
-                disabled=["Parameter", "Current value"],
-                column_config={c_: st.column_config.NumberColumn(format="%.5g")
-                               for c_ in ("Current value", "Minimum", "Maximum")},
-                key=f"reg_{V['aq_model']}_{V['aq_geom']}_{V['aq_inf']}_{KEY}")
-            go_btn = st.button("Run regression", type="primary")
-            if not AQ.active and DET["status"] == "aquifer":
-                st.warning("An additional energy source was detected but no aquifer is defined. "
-                           "Regression on G alone will not match the pressure trend; define the "
-                           "aquifer in tab 5 first.")
-
-        if go_btn:
-            pick = [i for i, r in ed.iterrows() if r["Regress"]]
-            if not pick:
-                left.error("Tick at least one parameter.")
-            else:
-                rk = [keys[i] for i in pick]
-                qs = [PARAMS[k][1] for k in rk]
-                x0 = [V[k] for k in rk]
-                lo_ = [U.from_disp(q, float(ed.loc[i, "Minimum"]), SYS) for i, q in zip(pick, qs)]
-                hi_ = [U.from_disp(q, float(ed.loc[i, "Maximum"]), SYS) for i, q in zip(pick, qs)]
-                if any(not (0 < a < b) for a, b in zip(lo_, hi_)):
-                    left.error("Each minimum must be positive and below its maximum.")
-                elif len(rk) >= n_pts - 1:
-                    left.error("More parameters than pressure points.")
-                else:
-                    base = dict(V)
-
-                    def sim(vals):
-                        return make_tank(dict(base, **dict(zip(rk, vals))), pvt, hist).simulate()[0]
-                    with st.spinner("Regressing..."):
-                        r = regress(sim, hist.p, x0, lo_, hi_)
-                    ss.reg = {"keys": rk, "x0": x0, "x": list(map(float, r["x"])),
-                              "rms0": r["rms0"], "rms": r["rms"], "se": r["se_rel"],
-                              "bound": r["at_bound"], "corr": r["corr"], "p": sim(r["x"]),
-                              "p0": sim(x0)}
-
+        SIG = hash((hist.p.tobytes(), hist.w.tobytes(), tank.gpw.tobytes()))
+        if ss.get("reg") and ss.reg.get("sig") != SIG:
+            ss.pop("reg")                       # history changed since the regression was run
         reg = ss.get("reg")
-        if reg:
-            with left:
-                c = st.columns(2)
-                pf = U.Q["pressure"][SYS][1]
-                c[0].metric(f"RMS before ({PU})", f"{reg['rms0'] * pf:,.1f}")
-                c[1].metric(f"RMS after ({PU})", f"{reg['rms'] * pf:,.1f}",
-                            delta=f"{(reg['rms'] - reg['rms0']) * pf:,.1f}", delta_color="inverse")
-                out = []
-                for k, a, b, se, bd in zip(reg["keys"], reg["x0"], reg["x"], reg["se"], reg["bound"]):
-                    lab_, q, *_ = PARAMS[k]
-                    out.append({"Parameter": ulabel(lab_, q), "Start": U.to_disp(q, a, SYS),
-                                "Matched": U.to_disp(q, b, SYS),
-                                "± 1 std. dev.": "n/a" if not np.isfinite(se) else f"{se:.0%}",
-                                "Note": "at limit" if bd else ""})
-                st.dataframe(pd.DataFrame(out), hide_index=True, width="stretch",
-                             column_config={c_: st.column_config.NumberColumn(format="%.5g")
-                                            for c_ in ("Start", "Matched")})
-                if any(np.isfinite(s) and s > 0.5 for s in reg["se"]):
-                    st.caption("A large standard deviation means the pressure data do not constrain "
-                               "that parameter on its own; fix it or regress on fewer parameters.")
+        pf = U.Q["pressure"][SYS][1]
+        r_scr, r_fit = st.tabs(["Survey screening", "Parameter regression"])
 
-                def _apply():
-                    for k, v in zip(ss.reg["keys"], ss.reg["x"]):
-                        V[k] = float(f"{v:.6g}")
-                    refresh()
-                st.button("Apply matched values to the model", on_click=_apply, type="primary")
+        # ---------------- survey screening
+        with r_scr:
+            left, right = st.columns([3, 3])
+            with left:
+                st.caption(f"Pressures and deviations in {PU}. "
+                           "Scores every pressure survey so you can decide which to switch off "
+                           "before regressing. Nothing is removed automatically, and a survey that "
+                           "is switched off keeps its production record.")
+                opts = ["Trend of the data (no model)",
+                        "Residuals of the latest regression" if reg else "Residuals of the current model"]
+                c = st.columns([3, 2])
+                how = c[0].radio("Compare each survey with", opts, key=f"scr_how_{bool(reg)}_{KEY}")
+                nsig = c[1].number_input("Flag beyond (standard deviations)", 1.5, 6.0, 3.0, 0.5,
+                                         key=f"scr_n_{KEY}")
+                by_trend = how == opts[0]
+                if by_trend:
+                    dev, z = trend_screen(tank.gpw, hist.p, hist.use, nsig)
+                    p_ref = None
+                else:
+                    p_ref = reg["p"] if reg else P_SIM
+                    dev, z = residual_screen(p_ref, hist.p, hist.use)
+                flag = np.isfinite(z) & (np.abs(z) > nsig)
+                flag[0] = False
+                new = flag & hist.use
+                tbl = pd.DataFrame({
+                    "Date": [d.date() for d in DATES[1:]],
+                    f"Pressure ({PU})": np.round(U.to_disp("pressure", hist.p[1:], SYS), 1),
+                    f"Deviation ({PU})": np.round(dev[1:] * pf, 1),
+                    "Score": np.round(z[1:], 1),
+                    "Flag": np.where(flag[1:], "suspect", ""),
+                    "Use": hist.use[1:], "Weight": hist.w_in[1:]})
+                ed_s = st.data_editor(
+                    tbl, hide_index=True, width="stretch", height=330,
+                    disabled=[c_ for c_ in tbl.columns if c_ not in ("Use", "Weight")],
+                    column_config={"Weight": st.column_config.NumberColumn(min_value=0.0, format="%.3g",
+                                                                           width="small"),
+                                   "Use": st.column_config.CheckboxColumn(width="small"),
+                                   "Date": st.column_config.DateColumn(width="small"),
+                                   tbl.columns[1]: st.column_config.NumberColumn("Pressure", width="small"),
+                                   tbl.columns[2]: st.column_config.NumberColumn("Deviation", width="small"),
+                                   "Flag": st.column_config.TextColumn(width="small"),
+                                   "Score": st.column_config.NumberColumn(
+                                       width="small",
+                                       help="Deviation divided by the typical scatter (from the "
+                                            "median absolute deviation of the active surveys).")},
+                    key=f"scr_ed_{KEY}")
+                b = st.columns(3)
+                if b[0].button(f"Switch off flagged ({int(new.sum())})", type="primary",
+                               disabled=not new.any(), width="stretch"):
+                    set_surveys({DATES[i].normalize(): (False, hist.w_in[i]) for i in np.flatnonzero(new)})
+                    st.rerun()
+                if b[1].button("Apply table edits", width="stretch",
+                               help="Applies the Use and Weight columns as edited above."):
+                    set_surveys({DATES[i + 1].normalize(): (as_flag(r_["Use"]), r_["Weight"])
+                                 for i, r_ in ed_s.reset_index(drop=True).iterrows()})
+                    st.rerun()
+                if b[2].button("Switch all on", width="stretch", disabled=N_ON == n_pts - 1):
+                    set_surveys({DATES[i].normalize(): (True, hist.w_in[i]) for i in range(1, n_pts)})
+                    st.rerun()
+
+                if new.sum() > 0.2 * max(N_ON, 1):
+                    st.warning(f"{int(new.sum())} of {N_ON} active surveys are flagged. That is too many "
+                               "to be bad data: the trend or the model is more likely at fault. "
+                               "Do not switch them all off.")
+                elif new.any():
+                    st.info(f"{int(new.sum())} of {N_ON} active surveys stand out. Check the survey "
+                            "reports (shut-in time, gauge, datum correction) before switching them off.")
+                else:
+                    st.success("No active survey stands out at this threshold.")
+                if not by_trend:
+                    rt = runs_test((hist.p - p_ref)[hist.use][1:])
+                    if rt["systematic"]:
+                        st.warning(
+                            f"**The mismatch is systematic, not scatter.** The residuals change sign "
+                            f"only {max(rt['runs'] - 1, 0)} times in {rt['n']} surveys (longest stretch on "
+                            f"one side: {rt['longest']}). That points to the model (aquifer, "
+                            "compressibility, PVT, gas in place), and switching surveys off would "
+                            "only hide it. Use the trend screen until the model fits.")
+                    else:
+                        st.caption(f"Runs test: residuals fall in {rt['runs']} runs against about "
+                                   f"{rt['expected']:.0f} expected for random scatter, so the model "
+                                   "shows no systematic bias.")
+                with st.expander("How the screening works"):
+                    st.markdown(
+                        "- **Trend of the data** compares each survey with a robust straight line "
+                        "through its three neighbours on each side of the pressure versus cumulative "
+                        "production trend. It needs no model, so it is the right check before any "
+                        "match exists.\n"
+                        "- **Residuals** compares each survey with the model pressure. Use it after "
+                        "regressing, ideally with the robust fitting method so the bad surveys have "
+                        "not already pulled the model towards themselves.\n"
+                        "- The **score** is the deviation divided by the typical scatter of the active "
+                        "surveys. Scatter is estimated from the median absolute deviation, which "
+                        "outliers cannot inflate.\n"
+                        "- **Weight** scales how strongly a survey counts in the regression "
+                        "(for example 2 for a long build-up, 0.5 for a short shut-in).")
             with right:
-                fig = figure(f"Cumulative wet gas produced ({GU})", f"Reservoir pressure ({PU})", height=440)
-                fig.add_trace(go.Scatter(x=gas_ip(tank.gpw), y=U.to_disp("pressure", reg["p0"], SYS),
-                                         mode="lines", name="Before regression",
-                                         line=dict(color=GREY, width=2, dash="dash")))
-                fig.add_trace(go.Scatter(x=gas_ip(tank.gpw), y=U.to_disp("pressure", reg["p"], SYS),
-                                         mode="lines", name="After regression",
-                                         line=dict(color=ORANGE, width=2)))
-                fig.add_trace(go.Scatter(x=gas_ip(tank.gpw), y=U.to_disp("pressure", hist.p, SYS),
-                                         mode="markers", name="History", marker=dict(color=BLUE, size=9)))
-                show(fig, "reg")
-        else:
-            with right:
-                fig = figure(f"Cumulative wet gas produced ({GU})", f"Reservoir pressure ({PU})", height=440)
-                fig.add_trace(go.Scatter(x=gas_ip(tank.gpw), y=U.to_disp("pressure", P_SIM, SYS),
-                                         mode="lines", name="Current model", line=dict(color=ORANGE, width=2)))
-                fig.add_trace(go.Scatter(x=gas_ip(tank.gpw), y=U.to_disp("pressure", hist.p, SYS),
-                                         mode="markers", name="History", marker=dict(color=BLUE, size=9)))
-                show(fig, "reg0")
+                fig = figure(f"Cumulative wet gas produced ({GU})", f"Reservoir pressure ({PU})", height=300)
+                if p_ref is not None:
+                    fig.add_trace(go.Scatter(x=gas_ip(tank.gpw), y=U.to_disp("pressure", p_ref, SYS),
+                                             mode="lines", name="Model", line=dict(color=ORANGE, width=2)))
+                history_points(fig, gas_ip(tank.gpw), U.to_disp("pressure", hist.p, SYS), new, size=8)
+                show(fig, "scr_p")
+                fig = figure("", "Score (standard deviations)", height=280, legend=False)
+                for m_, col_, sym_, nm_ in ((hist.use & ~flag, BLUE, "circle", "Active"),
+                                            (new, RED, "x", "Flagged"),
+                                            (~hist.use, GREY, "circle-open", "Switched off")):
+                    m_ = m_ & np.isfinite(z)
+                    m_[0] = False
+                    fig.add_trace(go.Scatter(x=DATES[m_], y=z[m_], mode="markers", name=nm_,
+                                             text=LAB[m_], marker=dict(color=col_, size=9, symbol=sym_)))
+                for y_ in (nsig, -nsig):
+                    fig.add_hline(y=y_, line_dash="dot", line_color=GREY)
+                fig.add_hline(y=0, line_color=GREY, line_width=1)
+                show(fig, "scr_z")
+
+        # ---------------- parameter regression
+        with r_fit:
+            st.subheader("Regress on parameters to match pressure history")
+            keys = ["G", "cf"] + aquifer_params(V["aq_model"], V["aq_geom"],
+                                                bool(V["aq_inf"]) and V["aq_model"] != "fetkovich")
+            default_on = {"G"} | set({"pot": ["aq_Wvol"], "schilthuis": ["aq_C"]}.get(
+                V["aq_model"], [k for k in keys if k in ("aq_reD", "aq_k", "aq_L")]))
+            rows = []
+            for k in keys:
+                lab_, q, lo_, hi_ = PARAMS[k]
+                cur_ = V[k]
+                a, b = max(cur_ * 0.2, lo_), min(cur_ * 5.0, hi_)
+                if k == "aq_reD":
+                    a, b = 1.2, max(20.0, cur_ * 2)
+                if k == "aq_theta":
+                    a, b = 10.0, 360.0
+                rows.append({"Regress": k in default_on, "Parameter": ulabel(lab_, q),
+                             "Current value": U.to_disp(q, cur_, SYS),
+                             "Minimum": U.to_disp(q, a, SYS), "Maximum": U.to_disp(q, b, SYS)})
+            left, right = st.columns([3, 3])
+            with left:
+                st.caption("Tick the parameters to adjust and set their limits. Regress on as few "
+                           "as needed: many aquifer parameters compensate for one another.")
+                ed = st.data_editor(
+                    pd.DataFrame(rows), hide_index=True, width="stretch",
+                    disabled=["Parameter", "Current value"],
+                    column_config={c_: st.column_config.NumberColumn(format="%.5g")
+                                   for c_ in ("Current value", "Minimum", "Maximum")},
+                    key=f"reg_{V['aq_model']}_{V['aq_geom']}_{V['aq_inf']}_{KEY}")
+                LOSSES = {"Least squares": "linear", "Robust (soft-L1)": "soft_l1"}
+                c = st.columns([2, 3])
+                loss_lab = c[0].selectbox(
+                    "Fitting method", list(LOSSES), key=f"loss_{KEY}",
+                    help="Least squares squares every residual, so one bad survey can pull the whole "
+                         "match. The robust method caps the pull of residuals larger than about twice "
+                         "the typical scatter, so isolated bad surveys are down-weighted without "
+                         "being removed.")
+                c[1].caption(f"{N_ON} of {n_pts - 1} pressure surveys are switched on"
+                             + ("" if np.allclose(hist.w[hist.use], 1.0) else ", with unequal weights")
+                             + ". Change them in Survey screening or in tab 2.")
+                go_btn = st.button("Run regression", type="primary")
+                if not AQ.active and DET["status"] == "aquifer":
+                    st.warning("An additional energy source was detected but no aquifer is defined. "
+                               "Regression on G alone will not match the pressure trend; define the "
+                               "aquifer in tab 5 first.")
+
+            def make_sim(base, rk):
+                def sim(vals):
+                    return make_tank(dict(base, **dict(zip(rk, vals))), pvt, hist).simulate()[0]
+                return sim
+
+            if go_btn:
+                pick = [i for i, r in ed.iterrows() if r["Regress"]]
+                if not pick:
+                    left.error("Tick at least one parameter.")
+                else:
+                    rk = [keys[i] for i in pick]
+                    qs = [PARAMS[k][1] for k in rk]
+                    x0 = [V[k] for k in rk]
+                    lo_ = [U.from_disp(q, float(ed.loc[i, "Minimum"]), SYS) for i, q in zip(pick, qs)]
+                    hi_ = [U.from_disp(q, float(ed.loc[i, "Maximum"]), SYS) for i, q in zip(pick, qs)]
+                    if any(not (0 < a < b) for a, b in zip(lo_, hi_)):
+                        left.error("Each minimum must be positive and below its maximum.")
+                    elif len(rk) >= N_ON:
+                        left.error("More parameters than active pressure surveys.")
+                    else:
+                        base = dict(V)
+                        sim = make_sim(base, rk)
+                        with st.spinner("Regressing..."):
+                            r = regress(sim, hist.p, x0, lo_, hi_, hist.w, LOSSES[loss_lab])
+                        ss.reg = {"keys": rk, "x0": x0, "x": list(map(float, r["x"])),
+                                  "rms0": r["rms0"], "rms": r["rms"], "se": r["se_rel"],
+                                  "bound": r["at_bound"], "corr": r["corr"], "p": r["p"],
+                                  "p0": sim(x0), "lo": lo_, "hi": hi_, "loss": LOSSES[loss_lab],
+                                  "loss_lab": loss_lab, "base": base, "sig": SIG}
+                        st.rerun()
+
+            if reg:
+                with left:
+                    c = st.columns(2)
+                    c[0].metric(f"RMS before ({PU})", f"{reg['rms0'] * pf:,.1f}")
+                    c[1].metric(f"RMS after ({PU})", f"{reg['rms'] * pf:,.1f}",
+                                delta=f"{(reg['rms'] - reg['rms0']) * pf:,.1f}", delta_color="inverse")
+                    out = []
+                    for k, a, b, se, bd in zip(reg["keys"], reg["x0"], reg["x"], reg["se"], reg["bound"]):
+                        lab_, q, *_ = PARAMS[k]
+                        out.append({"Parameter": ulabel(lab_, q), "Start": U.to_disp(q, a, SYS),
+                                    "Matched": U.to_disp(q, b, SYS),
+                                    "± 1 std. dev.": "n/a" if not np.isfinite(se) else f"{se:.0%}",
+                                    "Note": "at limit" if bd else ""})
+                    st.dataframe(pd.DataFrame(out), hide_index=True, width="stretch",
+                                 column_config={c_: st.column_config.NumberColumn(format="%.5g")
+                                                for c_ in ("Start", "Matched")})
+                    st.caption(f"Fitting method: {reg['loss_lab']}, on {N_ON} surveys. RMS is over the "
+                               "surveys that are switched on.")
+                    if any(np.isfinite(s) and s > 0.5 for s in reg["se"]):
+                        st.caption("A large standard deviation means the pressure data do not constrain "
+                                   "that parameter on its own; fix it or regress on fewer parameters.")
+
+                    def _apply():
+                        for k, v in zip(ss.reg["keys"], ss.reg["x"]):
+                            V[k] = float(f"{v:.6g}")
+                        refresh()
+                    st.button("Apply matched values to the model", on_click=_apply, type="primary")
+
+                    rt = runs_test((hist.p - reg["p"])[hist.use][1:])
+                    _, z_fit = residual_screen(reg["p"], hist.p, hist.use)
+                    n_out = int((hist.use & np.isfinite(z_fit) & (np.abs(z_fit) > 3.0)).sum())
+                    if rt["systematic"]:
+                        st.warning(f"The residuals are systematic (only {max(rt['runs'] - 1, 0)} sign "
+                                   f"changes in {rt['n']} surveys): the model is still missing "
+                                   "something. Revisit the aquifer or the regressed parameters "
+                                   "rather than switching surveys off.")
+                    elif n_out:
+                        st.info(f"{n_out} active survey{'s' if n_out > 1 else ''} sit more than 3 standard "
+                                "deviations from this match. Review them in Survey screening "
+                                "(residuals of the latest regression)."
+                                + (" A least-squares fit bends towards bad surveys and can make good "
+                                   "neighbours look bad, so rerun with the robust fitting method "
+                                   "before trusting these flags." if reg["loss"] == "linear" else ""))
+
+                    if st.button("Influence check (leave one survey out)",
+                                 help="Repeats the fit with each survey switched off in turn and "
+                                      "reports how far the matched values move. Takes a few seconds."):
+                        with st.spinner("Refitting without each survey in turn..."):
+                            ss.reg["loo"] = leave_one_out(make_sim(reg["base"], reg["keys"]), hist.p,
+                                                          reg["x"], reg["lo"], reg["hi"], hist.w,
+                                                          reg["loss"])
+                        st.rerun()
+                    if "loo" in reg:
+                        loo = reg["loo"]
+                        worst = np.nan_to_num(np.nanmax(np.abs(np.where(np.isfinite(loo), loo, 0.0)), axis=1))
+                        order = [i for i in np.argsort(-worst) if hist.use[i] and i > 0][:6]
+                        d = {"Survey removed": [LAB[i] for i in order]}
+                        for j_, k in enumerate(reg["keys"]):
+                            d[f"Change in {PARAMS[k][0].lower()}"] = [f"{loo[i, j_]:+.1%}" for i in order]
+                        st.dataframe(pd.DataFrame(d), hide_index=True, width="stretch")
+                        st.caption("The six most influential surveys. A single survey that moves the "
+                                   "answer by much more than the others deserves a second look.")
+                with right:
+                    fig = figure(f"Cumulative wet gas produced ({GU})", f"Reservoir pressure ({PU})", height=440)
+                    fig.add_trace(go.Scatter(x=gas_ip(tank.gpw), y=U.to_disp("pressure", reg["p0"], SYS),
+                                             mode="lines", name="Before regression",
+                                             line=dict(color=GREY, width=2, dash="dash")))
+                    fig.add_trace(go.Scatter(x=gas_ip(tank.gpw), y=U.to_disp("pressure", reg["p"], SYS),
+                                             mode="lines", name="After regression",
+                                             line=dict(color=ORANGE, width=2)))
+                    history_points(fig, gas_ip(tank.gpw), U.to_disp("pressure", hist.p, SYS))
+                    show(fig, "reg")
+            else:
+                with right:
+                    fig = figure(f"Cumulative wet gas produced ({GU})", f"Reservoir pressure ({PU})", height=440)
+                    fig.add_trace(go.Scatter(x=gas_ip(tank.gpw), y=U.to_disp("pressure", P_SIM, SYS),
+                                             mode="lines", name="Current model", line=dict(color=ORANGE, width=2)))
+                    history_points(fig, gas_ip(tank.gpw), U.to_disp("pressure", hist.p, SYS))
+                    show(fig, "reg0")

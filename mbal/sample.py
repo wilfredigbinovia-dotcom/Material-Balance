@@ -34,8 +34,14 @@ def sample_pvt_table(c=None):
                              c["co2"], c["h2s"], c["n2"], c["z2"])
 
 
-def sample_case(seed=7):
-    """Returns (config, pvt_table, reservoir_history_df, wells_df, pressures_df, start_date)."""
+BAD_SURVEYS = {19: 160.0, 22: 180.0}    # history row -> error added, psi
+
+
+def sample_case(seed=7, bad=True):
+    """Returns (config, pvt_table, reservoir_history_df, wells_df, pressures_df, start_date).
+
+    With bad=True two surveys carry a gross error (BAD_SURVEYS) so the survey screening
+    can be tried: both read high, as if the gauge sat above datum or the correction was wrong."""
     c = default_config()
     tab = sample_pvt_table(c)
     pvt = PVT.from_frame(tab, c["T"], c["api"], wet_gas_gravity(c["sg"], c["cgr_i"], c["api"]))
@@ -56,6 +62,9 @@ def sample_case(seed=7):
         p[i] = make_tank(true, pvt, h).simulate()[0][i]
     rng = np.random.default_rng(seed)
     p_obs = p + rng.normal(0.0, 12.0, n)
+    if bad:
+        for i, e in BAD_SURVEYS.items():
+            p_obs[i] += e
     hist = pd.DataFrame({"date": dates[1:], "p": np.round(p_obs[1:], 0),
                          "gp": np.round(gp[1:] / 1e6, 1), "np": np.round(np_[1:] / 1e3, 1),
                          "wp": np.round(wp[1:] / 1e3, 1)})
@@ -66,5 +75,6 @@ def sample_case(seed=7):
                                      "np": np.round(hist["np"] * s, 1),
                                      "wp": np.round(hist["wp"] * s, 1)})
                        for w, s in shares.items()], ignore_index=True)
-    pressures = hist[["date", "p"]].copy()
+    hist["use"], hist["w"] = True, 1.0
+    pressures = hist[["date", "p", "use", "w"]].copy()
     return c, tab, hist, wells, pressures, start.date()

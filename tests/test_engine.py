@@ -7,8 +7,9 @@ from mbal.aquifer import WD, pD, Aquifer
 from mbal.pvt import PVT, z_dak, wet_gas_gravity
 from mbal.matbal import build_history, graphical, detect_drive, METHODS, aggregate_wells
 from mbal.model import make_tank
-from mbal.regress import regress, pressure_rms
-from mbal.sample import sample_case, TRUTH
+from mbal.regress import regress, pressure_rms, leave_one_out
+from mbal.outliers import trend_screen, residual_screen, runs_test
+from mbal.sample import sample_case, TRUTH, BAD_SURVEYS
 
 
 def test_veh_infinite_radial():
@@ -39,8 +40,8 @@ def test_carter_tracy_and_fetkovich_track_veh():
     assert abs(ct / veh - 1) < 0.06 and abs(fk / veh - 1) < 0.10
 
 
-def _case():
-    c, tab, hist, wells, pres, start = sample_case()
+def _case(bad=False):
+    c, tab, hist, wells, pres, start = sample_case(bad=bad)
     pvt = PVT.from_frame(tab, c["T"], c["api"], wet_gas_gravity(c["sg"], c["cgr_i"], c["api"]))
     return c, pvt, build_history(hist, start, c["pi"]), (hist, wells, pres)
 
@@ -81,6 +82,58 @@ def test_all_methods_run_and_wells_aggregate():
         assert len(g["x"]) == len(h.p)
     agg = aggregate_wells(wells, pres)
     assert np.allclose(agg["gp"], hist["gp"], rtol=1e-3, atol=0.3)
+
+
+def test_survey_screening():
+    c, pvt, h, _ = _case(bad=True)
+    bad = sorted(BAD_SURVEYS)
+    c2 = dict(c, aq_model="veh")
+    keys, lo, hi = ["G", "aq_reD", "aq_k"], [50, 1.5, 5], [1000, 20, 1000]
+    tank = make_tank(c2, pvt, h)
+
+    def sim(v):
+        return make_tank(dict(c2, **dict(zip(keys, v))), pvt, h).simulate()[0]
+
+    # 1. model-free trend screen finds exactly the two bad surveys
+    _, z = trend_screen(tank.gpw, h.p)
+    assert sorted(np.flatnonzero(np.abs(z) > 3)) == bad
+    # 2. ordinary least squares is dragged; the robust loss is not
+    x0 = [c2[k] for k in keys]
+    ols = regress(sim, h.p, x0, lo, hi)
+    rob = regress(sim, h.p, x0, lo, hi, loss="soft_l1")
+    assert abs(rob["x"][0] / TRUTH["G"] - 1) < 0.03
+    assert abs(rob["x"][0] / TRUTH["G"] - 1) <= abs(ols["x"][0] / TRUTH["G"] - 1) + 1e-3
+    # 3. residuals of the robust fit flag the same two surveys
+    _, zr = residual_screen(rob["p"], h.p)
+    assert sorted(np.flatnonzero(np.abs(zr) > 3)) == bad
+    # 4. switching them off gives the clean answer with ordinary least squares
+    w = h.w.copy(); w[bad] = 0.0
+    off = regress(sim, h.p, x0, lo, hi, w)
+    assert off["rms"] < 20 and abs(off["x"][0] / TRUTH["G"] - 1) < 0.03
+    # 5. the single most influential survey on the ordinary fit is one of the bad ones
+    infl = np.abs(leave_one_out(sim, h.p, ols["x"], lo, hi, h.w))[1:].max(axis=1)
+    assert int(np.argmax(infl)) + 1 in bad
+
+
+def test_runs_test_separates_model_error_from_scatter():
+    c, pvt, h, _ = _case()
+    good = make_tank(dict(c, aq_model="veh", **TRUTH), pvt, h).simulate()[0]
+    assert not runs_test(h.p - good)["systematic"]
+    none = make_tank(dict(c, G=300.0), pvt, h).simulate()[0]     # no aquifer: wrong model
+    assert runs_test(h.p - none)["systematic"]
+
+
+def test_switched_off_survey_is_ignored_everywhere():
+    c, pvt, h, (hist, wells, pres) = _case(bad=True)
+    hist = hist.copy()
+    hist.loc[[i - 1 for i in BAD_SURVEYS], "use"] = False
+    h2 = build_history(hist, "2014-01-01", c["pi"])
+    assert (~h2.use).sum() == 2 and h2.w[~h2.use].sum() == 0
+    tank = make_tank(dict(c, aq_model="veh", **TRUTH), pvt, h2)
+    assert not graphical(tank, "(F-We)/Et (Cole)")["sel"][sorted(BAD_SURVEYS)].any()
+    assert pressure_rms(tank.simulate()[0], h2.p, h2.w) < 20
+    pres = pres.copy(); pres.loc[0, "use"] = False
+    assert not aggregate_wells(wells, pres)["use"].iloc[0]
 
 
 if __name__ == "__main__":
