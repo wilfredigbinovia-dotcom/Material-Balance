@@ -4,7 +4,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from mbal.aquifer import WD, pD, Aquifer
-from mbal.pvt import PVT, z_dak, wet_gas_gravity
+from mbal.pvt import PVT, z_dak, wet_gas_gravity, cvd_two_phase_z
 from mbal.matbal import build_history, graphical, detect_drive, METHODS, aggregate_wells
 from mbal.model import make_tank
 from mbal.regress import regress, pressure_rms, leave_one_out
@@ -134,6 +134,35 @@ def test_switched_off_survey_is_ignored_everywhere():
     assert pressure_rms(tank.simulate()[0], h2.p, h2.w) < 20
     pres = pres.copy(); pres.loc[0, "use"] = False
     assert not aggregate_wells(wells, pres)["use"].iloc[0]
+
+
+def test_cvd_two_phase_z():
+    import pandas as pd
+    # A two-phase cell built from first principles: constant volume, known moles in each phase.
+    pd_, zd = 5000.0, 1.05
+    p = np.array([6000.0, 5000.0, 4000.0, 3000.0, 2000.0, 1000.0])
+    zg = np.array([1.14, 1.05, 0.93, 0.87, 0.86, 0.91])
+    sl = np.array([0.0, 0.0, 12.0, 18.0, 17.0, 14.0])          # % of cell volume
+    nl = np.array([0.0, 0.0, 0.10, 0.14, 0.13, 0.11])          # moles in liquid / initial moles
+    ng = (p / zg) * (1 - sl / 100) / (pd_ / zd)                # moles in gas / initial moles
+    gp = np.where(p >= pd_, 0.0, 1 - ng - nl) * 100
+    out, zd_used, notes = cvd_two_phase_z(pd.DataFrame({"p": p, "sl": sl, "gp": gp, "zg": zg}), pd_)
+    assert zd_used == zd and not notes
+    assert np.allclose(out["z"], [1.14, 1.05] + list(p[2:] / ((pd_ / zd) * (ng + nl)[2:])))
+    assert np.allclose(out["liq_mol"], nl * 100, atol=1e-9)
+    # p/Z2 is a straight line against cumulative produced, which is what the p/z plot relies on
+    assert np.allclose((out["p"] / out["z"])[1:], ((pd_ / zd) * (1 - out["gp"] / 100))[1:])
+    # fractions entered instead of percent, and a liquid column that cannot be right, are reported
+    _, _, n1 = cvd_two_phase_z(pd.DataFrame({"p": p, "sl": sl, "gp": gp, "zg": zg * 0.5}), pd_, zd)
+    assert any("not consistent" in m for m in n1)
+    # no dew point row: needs Zd, or interpolates it
+    try:
+        cvd_two_phase_z(pd.DataFrame({"p": p[2:], "gp": gp[2:]}), pd_)
+        assert False
+    except ValueError:
+        pass
+    o2, _, _ = cvd_two_phase_z(pd.DataFrame({"p": p[2:], "gp": gp[2:]}), pd_, zd)
+    assert np.allclose(o2["z"], out["z"][2:])
 
 
 if __name__ == "__main__":

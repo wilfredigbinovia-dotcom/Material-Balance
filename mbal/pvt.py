@@ -129,6 +129,84 @@ def correlation_table(sg_sep, cgr_i, api, T, p_dew, p_max, co2=0.0, h2s=0.0, n2=
     return pd.DataFrame({"p": p, "z": z, "cgr": cgr})
 
 
+def cvd_two_phase_z(df, p_dew, z_dew=None):
+    """Two-phase Z from a constant-volume-depletion report that does not list it.
+
+    df columns: p [psia], gp = cumulative well-stream produced [mol % of the fluid at the dew
+    point], and optionally zg = equilibrium (single-phase) gas Z and sl = retrograde liquid
+    [% of the cell volume at the dew point].
+
+    The cell volume is constant, so a mole balance on what is left in it gives
+        Z2 = p / [ (pd / Zd) * (1 - Gp) ]
+    At and above the dew point the fluid is single phase and Z2 = Zg.
+
+    The liquid volume and the gas Z are not needed for Z2 itself; they are used to check the
+    report: the moles left as liquid,
+        nL = (1 - Gp) - (p / Zg) * (1 - SL) / (pd / Zd),
+    must be positive (returned as liq_mol, mol % of the initial fluid).
+
+    z_dew: gas Z at the dew point. If None it is read from the table (row at the dew point,
+    otherwise interpolated between the rows either side of it).
+    Returns (DataFrame[p, z, zg, sl, gp, liq_mol], z_dew, list of warnings).
+    """
+    d = df.copy()
+    for col in ("p", "gp", "zg", "sl"):
+        d[col] = pd.to_numeric(d[col], errors="coerce") if col in d else np.nan
+    d = d.dropna(subset=["p"]).drop_duplicates("p").sort_values("p", ascending=False)
+    d = d[d["p"] > 0].reset_index(drop=True)
+    if d.empty:
+        raise ValueError("Enter the CVD table first.")
+    tol = 0.003 * p_dew
+    above = d["p"].to_numpy() >= p_dew - tol
+    notes = []
+
+    if z_dew is None or not z_dew > 0:
+        zrow = d[(d["p"] - p_dew).abs() <= tol]["zg"].dropna()
+        known = d.dropna(subset=["zg"]).sort_values("p")
+        if len(zrow):
+            z_dew = float(zrow.iloc[0])
+        elif len(known) >= 2 and known["p"].iloc[0] < p_dew < known["p"].iloc[-1]:
+            z_dew = float(np.interp(p_dew, known["p"], known["zg"]))
+            notes.append("No row at the dew point: Z at the dew point was interpolated from the "
+                         "gas Z column. Enter it directly if the report gives it.")
+        else:
+            raise ValueError("The gas Z-factor at the dew point is needed: add a row at the dew "
+                             "point pressure or enter the value.")
+
+    gp = d["gp"].to_numpy(float) / 100.0
+    gp = np.where(above & np.isnan(gp), 0.0, gp)
+    if np.nanmax(np.where(above, gp, 0.0)) > 1e-6:
+        notes.append("Fluid is reported as produced at or above the dew point. Check the dew "
+                     "point pressure entered under Fluid description.")
+    with np.errstate(divide="ignore", invalid="ignore"):
+        z2 = d["p"].to_numpy() / ((p_dew / z_dew) * (1.0 - gp))
+    zg = d["zg"].to_numpy(float)
+    z = np.where(above, np.where(np.isnan(zg), np.nan, zg), z2)
+    z = np.where(np.abs(d["p"].to_numpy() - p_dew) <= tol, z_dew, z)
+    sl = np.where(above & d["sl"].isna().to_numpy(), 0.0, d["sl"].to_numpy(float)) / 100.0
+    liq = (1.0 - gp) - (d["p"].to_numpy() / zg) * (1.0 - sl) / (p_dew / z_dew)
+    liq = np.where(above, 0.0, liq)
+
+    below = ~above
+    if np.any(below & np.isnan(d["gp"].to_numpy(float))):
+        notes.append("Rows below the dew point without a cumulative produced value cannot be "
+                     "converted and are left out.")
+    g = gp[below & ~np.isnan(gp)]
+    if len(g) and (np.any(np.diff(g) <= 0) or g.min() <= 0 or g.max() >= 1):
+        notes.append("Cumulative produced should rise steadily from 0 towards 100 mol % as "
+                     "pressure falls. Check the column (it must be in percent, not a fraction).")
+    if np.any(liq[below & ~np.isnan(liq)] < -0.005):
+        notes.append("The gas Z and retrograde liquid columns leave less than zero moles in the "
+                     "liquid phase at some pressures: the report columns are not consistent "
+                     "(check units of the liquid volume and which Z column was copied).")
+    bad = below & ~np.isnan(z) & ((z < 0.3) | (z > 2.5))
+    if np.any(bad):
+        notes.append("Some calculated two-phase Z values are outside 0.3 to 2.5.")
+    out = pd.DataFrame({"p": d["p"], "z": z, "zg": zg, "sl": sl * 100.0, "gp": gp * 100.0,
+                        "liq_mol": liq * 100.0})
+    return out, z_dew, notes
+
+
 # ----------------------------------------------------------------- PVT object
 @dataclass
 class PVT:

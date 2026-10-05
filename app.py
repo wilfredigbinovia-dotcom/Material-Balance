@@ -15,7 +15,7 @@ from mbal import units as U
 from mbal.aquifer import GEOMETRIES, MODELS, NEEDS_GEOMETRY, WD
 from mbal.matbal import METHODS, aggregate_wells, build_history, detect_drive, graphical
 from mbal.model import PARAMS, aquifer_params, make_aquifer, make_tank
-from mbal.pvt import (PVT, condensate_props, correlation_table, gas_equivalent, hall_cf,
+from mbal.pvt import (PVT, condensate_props, correlation_table, cvd_two_phase_z, gas_equivalent, hall_cf,
                       water_props, wet_gas_gravity)
 from mbal.outliers import residual_screen, runs_test, trend_screen
 from mbal.regress import leave_one_out, pressure_rms, regress
@@ -31,6 +31,9 @@ SURVEY = [("use", "Use", "bool"), ("w", "Weight", "weight")]   # pressure survey
 TABLES = {  # name -> [(column, label, quantity or None)]
     "pvt": [("p", "Pressure", "pressure"), ("z", "Z-factor (two-phase below dew point)", None),
             ("cgr", "Producing CGR (optional)", "cgr")],
+    "cvd": [("p", "Pressure", "pressure"), ("sl", "Retrograde liquid (% of volume at dew point)", None),
+            ("gp", "Cum. produced fluid (mol % of initial)", None),
+            ("zg", "Gas Z-factor (single phase)", None)],
     "hist": [("date", "Date", "date"), ("p", "Reservoir pressure", "pressure"),
              ("gp", "Cum. gas", "gas_cum"), ("np", "Cum. condensate", "liq_cum"),
              ("wp", "Cum. water", "liq_cum")] + SURVEY,
@@ -64,7 +67,7 @@ def load_sample():
     c, tab, hist, wells, pres, start = sample_case()
     c.update(start_date=start, hist_mode="By reservoir")
     ss.vals = c
-    ss.cur = {"pvt": tab, "hist": hist, "wells": wells, "pres": pres}
+    ss.cur = {"pvt": tab, "hist": hist, "wells": wells, "pres": pres, "cvd": empty_table("cvd")}
     ss.ver = ss.get("ver", 0)
     refresh()
 
@@ -223,10 +226,10 @@ def table(name, height=350):
     return ss.cur[name]
 
 
-def csv_upload(name, note):
+def csv_upload(name, note, expander=True):
     """Import a CSV (columns in the order shown, in the currently selected units)."""
     spec = TABLES[name]
-    with st.expander("Import from CSV"):
+    with (st.expander("Import from CSV") if expander else st.container()):
         st.caption(f"Columns in this order: {', '.join(ulabel(l, q) for _, l, q in spec)}. "
                    f"Values in the currently selected units. {note}")
         f = st.file_uploader("CSV file", type=["csv", "txt"], key=f"up_{name}")
@@ -332,6 +335,43 @@ with t_pvt:
                                                   V["pvt_pmax"], V["co2"], V["h2s"], V["n2"], V["z2"])
                 refresh()
             st.button("Generate table (replaces current table)", on_click=_fill_pvt)
+        with st.expander("Calculate two-phase Z from a CVD report"):
+            st.caption("For reports that give retrograde liquid deposit, cumulative produced "
+                       "fluid and the single-phase (equilibrium gas) Z instead of the two-phase "
+                       "Z. Enter the CVD rows, including the dew point row if the report has it. "
+                       "Rows above the dew point need only pressure and gas Z.")
+            cvd_df = table("cvd", height=260)
+            csv_upload("cvd", "", expander=False)
+            num("Gas Z-factor at the dew point (0 = take from the table)", "cvd_zd", None,
+                step=0.01, minv=0.0, maxv=3.0)
+            CVD_OUT = None
+            if cvd_df["p"].notna().any():
+                try:
+                    CVD_OUT, zd_used, cvd_notes = cvd_two_phase_z(cvd_df, V["pd"], V["cvd_zd"] or None)
+                    st.caption(f"Z2 = p / [(pd/Zd)(1 − Gp)] with pd = "
+                               f"{U.to_disp('pressure', V['pd'], SYS):,.6g} {PU} and Zd = {zd_used:.4f}. "
+                               "Liquid remaining is a consistency check from the liquid volume "
+                               "and gas Z; it must be positive.")
+                    st.dataframe(
+                        pd.DataFrame({ulabel("Pressure", "pressure"): U.to_disp("pressure", CVD_OUT["p"], SYS),
+                                      "Two-phase Z": CVD_OUT["z"].round(4),
+                                      "Gas Z": CVD_OUT["zg"],
+                                      "Liquid remaining (mol % of initial)": CVD_OUT["liq_mol"].round(2)}),
+                        hide_index=True, width="stretch", height=220)
+                    for m in cvd_notes:
+                        st.warning(m)
+                except Exception as e:  # noqa: BLE001
+                    st.warning(str(e))
+
+            def _use_cvd():
+                sync_tables()
+                new = CVD_OUT.dropna(subset=["z"])[["p", "z"]].sort_values("p").reset_index(drop=True)
+                old = ss.cur["pvt"].dropna(subset=["p", "cgr"]).sort_values("p")
+                new["cgr"] = np.interp(new["p"], old["p"], old["cgr"]) if len(old) >= 2 else np.nan
+                ss.cur["pvt"] = new
+                refresh()
+            st.button("Use these Z-factors (replaces current table)", on_click=_use_cvd,
+                      disabled=CVD_OUT is None or CVD_OUT["z"].notna().sum() < 2)
 
     PVT_OK, pvt = True, None
     try:

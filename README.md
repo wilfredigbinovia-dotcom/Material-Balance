@@ -13,6 +13,7 @@ The app opens in your browser with a synthetic sample case loaded
 ## Workflow
 
 1. **PVT data** - fluid description and Z-factor table (lab CVD table, CSV import, or correlations).
+   If the CVD report has no two-phase Z, it is calculated from the cumulative produced fluid (see Method).
 2. **Production history** - cumulative gas, condensate, water and reservoir pressure, by reservoir or by well.
 3. **Reservoir parameters** - initial pressure, porosity, connate water, rock compressibility, first estimate of gas in place.
 4. **History match** - graphical plots (p/z, p/z overpressured, Havlena-Odeh overpressured, Havlena-Odeh water drive,
@@ -53,6 +54,10 @@ G is the wet (well-stream) gas initially in place.
 
 * Single-phase Z: Dranchuk-Abou-Kassem, Sutton pseudo-criticals, Wichert-Aziz correction.
 * Two-phase Z: Rayes-Piper-McCain-Poston (1992), scaled to be continuous at the dew point.
+* Two-phase Z from a CVD report: Z2 = p / [(pd/Zd)(1 - Gp)], Gp = cumulative well-stream produced as a
+  fraction of the fluid at the dew point, Zd = gas Z at the dew point. The retrograde liquid volume SL and
+  the equilibrium gas Z are used as a check: the liquid moles left, (1 - Gp) - (p/Zg)(1 - SL)/(pd/Zd),
+  must be positive.
 * Aquifer dimensionless functions (WD, pD) are computed by Stehfest inversion of the Laplace-space
   solutions, so any re/ro can be used without table look-up.
 * Bottom drive is modelled as vertical linear flow through the reservoir area (kv = k * kv/kh).
