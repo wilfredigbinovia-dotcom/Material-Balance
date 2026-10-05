@@ -1,271 +1,52 @@
-# resmb
+# Condensate MBAL
 
-Reservoir material balance in Python, in field units.
+Material balance tool for retrograde gas-condensate reservoirs (oil and dry-gas modules to follow).
 
-- **Single-tank analysis** for oil and gas reservoirs (Havlena–Odeh straight line, p/z, drive indices)
-- **Aquifer models**: pot, Schilthuis steady state, Van Everdingen–Hurst (radial or linear), Fetkovich
-- **Multi-tank simulator** with transmissibility between tanks and pressure history matching
-- **PVT correlations** for black oil, gas and water
+## Run
 
-The calculations are in one file, `resmb.py`. `app.py` is a Streamlit app on top of it, and `examples.py` runs five worked cases as a script.
+    pip install -r requirements.txt
+    streamlit run app.py
 
-## Install
+The app opens in your browser with a synthetic sample case loaded
+(250 Bscf wet gas, finite radial aquifer with re/ro = 5 and k = 40 md).
 
-Python 3.9 or later.
+## Workflow
 
-```bash
-pip install -r requirements.txt
-python examples.py
-```
+1. **PVT data** - fluid description and Z-factor table (lab CVD table, CSV import, or correlations).
+2. **Production history** - cumulative gas, condensate, water and reservoir pressure, by reservoir or by well.
+3. **Reservoir parameters** - initial pressure, porosity, connate water, rock compressibility, first estimate of gas in place.
+4. **History match** - graphical plots (p/z, p/z overpressured, Havlena-Odeh overpressured, Havlena-Odeh water drive,
+   Cole (F-We)/Et, Roach, Cole F/Et), analytical plot (pressure vs cumulative production), energy plot, WD function plot.
+5. **Aquifer** - automatic detection of an extra energy source, then model (small pot, Schilthuis, Hurst-van Everdingen,
+   Carter-Tracy, Fetkovich) and system (radial, linear, bottom drive).
+6. **Regression** - least-squares match of model pressure to history on any ticked parameters.
 
-`examples.py` prints the results of each case and saves four charts as PNG files next to the script. It takes about ten seconds.
+Units switch between Field and SI in the sidebar. Projects save to and load from a JSON file.
 
-Tested with Python 3.13, numpy 2.5, scipy 1.18, pandas 3.0, matplotlib 3.11 and streamlit 1.64. The minimum versions in `requirements.txt` are not tested.
+## Method
 
-## Streamlit app
+    F = G (Eg + Efw) + We
+    F   = Gp,wet * Bg + Wp * Bw
+    Eg  = Bg - Bgi                 (two-phase Z below the dew point)
+    Efw = Bgi (cw*Swi + cf)/(1 - Swi) * (pi - p)
+    Gp,wet = Gp,separator + GE * Np    with GE = 133,316 * SGo / Mo  scf/STB
 
-```bash
-streamlit run app.py
-```
+G is the wet (well-stream) gas initially in place.
 
-Run `app.py`, not `resmb.py`: `resmb.py` is the library and shows nothing on its own. Keep both files in the same folder.
-
-The sidebar switches between four pages: Oil reservoir, Gas reservoir, Multi-tank and PVT correlations. Tables can be edited in place or loaded from a CSV, and results can be downloaded as CSV.
-
-### Bringing in data
-
-The Oil and Gas pages offer three ways to fill the history table:
-
-- **Type in or use a sample.**
-- **By reservoir (one history file).** A CSV or Excel file with `t` (days) or `date`, then the table's columns (`p, Np, Gp, ...`), cumulative, first row initial conditions. Add a `reservoir` column to keep several reservoirs in one file and pick one in the app.
-- **By well (production + pressure files).** One production file covering all the wells, however many there are, and one pressure survey file. The app sums the wells, averages the surveys and interpolates the cumulatives to each survey date.
-
-| File | Columns | Optional |
-|---|---|---|
-| Well production | `well`, `date` (or `t` in days), `oil`, `gas`, `water` | `reservoir`, `winj`, `ginj` |
-| Pressure surveys | `date` (or `t`), `pressure` | `well`, `reservoir` |
-
-Options for well files: volumes per period or cumulative per well, whether each date marks the end or start of its period, the units of the file, whether to average surveys by date, month, quarter or year, which wells to include, and an initial pressure if there is no survey before production started. Column names are matched without regard to case. Both files must use the same kind of time column. Example files can be downloaded from the app.
-
-PVT columns built from well files are filled from the PVT correlations page. Replace them with lab values where you have them.
-
-On the Multi-tank page, the same two sources load every reservoir in the file as a tank, with the pressure surveys as observed pressures.
-
-To deploy on Streamlit Community Cloud, put `app.py`, `resmb.py` and `requirements.txt` in the root of a GitHub repository and set the main file to `app.py`.
-
-## Units
-
-| Quantity | Unit |
-|---|---|
-| Pressure | psia |
-| Time | days |
-| Np, Wp, Winj | MMSTB |
-| Gp, Ginj (oil analysis, all multi-tank tanks) | MMscf |
-| Gp (`gas_mbe`) | Bscf |
-| Bo, Bw | rb/STB |
-| Rs | scf/STB |
-| Bg | rb/scf |
-| Compressibility | 1/psi |
-| F, We, crossflow | MMrb |
-| Oil in place | MMSTB |
-| Gas in place | Bscf |
-| Aquifer constant C or B | rb/psi |
-| Aquifer productivity J | rb/(day·psi) |
-| Wei in `Aquifer` results | bbl |
-| Wei in `Tank` | MMbbl |
-| Transmissibility T | rb/(day·psi) |
-
-## Oil reservoir
-
-Put the production and PVT history in a DataFrame. **Row 0 is initial conditions** (zero production, initial pressure).
-
-Required columns: `p, Np, Gp, Bo, Rs, Bg`. Optional: `t, Wp, Winj, Ginj, Bw`. Volumes are cumulative.
-
-```python
-import pandas as pd
-from resmb import oil_mbe
-
-data = pd.read_csv("history.csv")
-result = oil_mbe(data, Swi=0.2, cw=3e-6, cf=4e-6, m=0.3)
-
-print(result.in_place)   # N, MMSTB
-print(result.gas_cap)    # Bscf
-print(result.r2)
-print(result.table)      # F, Eo, Eg, Efw, Et, We, F/Et and drive indices per row
-```
-
-Set `fit_m=True` to estimate the gas cap ratio from the data instead of fixing it. The estimate is sensitive to scatter; fix `m` from logs or seismic where you can.
-
-## Aquifers
-
-Pass an `Aquifer` to `oil_mbe` or `gas_mbe`. The `t` column is needed for every model except `pot`.
-
-```python
-from resmb import Aquifer
-
-aq = Aquifer(model="veh", geometry="radial",
-             k=150, phi=0.2, mu_w=0.4, ct=7e-6, h=60,
-             ro=4000, reD=8, theta=180, tune=True)
-result = oil_mbe(data, Swi=0.2, aquifer=aq)
-print(result.aquifer)    # B, td_per_day, implied_k, ...
-```
-
-| `model` | Fitted | Needs |
-|---|---|---|
-| `"pot"` | C | nothing |
-| `"steady"` | C | `t` |
-| `"veh"` | B, and the time constant if `tune=True` | rock properties and geometry |
-| `"fetkovich"` | Wei and J if `tune=True`, otherwise taken from the inputs | rock properties, finite `reD` |
-
-Geometry is `"radial"` (`ro`, `reD`, `theta`; leave `reD` at its default for an infinite aquifer) or `"linear"` (`L`, `w`, closed outer end).
-
-`Aquifer.constants(pi)` returns the time constant, influx constant, water volume and productivity implied by the rock properties. `WD(tD, geometry, reD)` gives the Van Everdingen–Hurst dimensionless influx on its own.
-
-## Analytical history match
-
-The straight-line method above fits the material balance terms. The analytical method, as in commercial material balance packages, instead predicts the tank pressure at each survey from the production history and regresses the parameters you choose until predicted and measured pressures agree.
-
-```python
-from resmb import Aquifer, analytical_match, simulate_tank
-
-aq = Aquifer(model="veh", geometry="radial", k=50, phi=0.2, mu_w=0.4, ct=7e-6,
-             h=60, ro=4000, reD=8, theta=180)                 # starting values
-match = analytical_match(data, in_place=150, fit=["in_place", "k"],
-                         fluid="oil", Swi=0.2, cw=3e-6, cf=4e-6, m=0.0, aquifer=aq)
-print(match.rms_before, match.rms_after)   # psi
-print(match.fitted)                        # {'in_place': ..., 'k': ...}
-print(match.warnings)
-print(match.table)                         # t, p_obs, p_start, p_sim, We
-
-sim = simulate_tank(data, in_place=100, aquifer=match.aquifer)   # prediction only, no regression
-```
-
-| `fit` name | Parameter | Applies to |
-|---|---|---|
-| `in_place` | Oil or gas in place | always |
-| `m` | Gas cap ratio | oil |
-| `C` | Aquifer constant | pot, steady |
-| `reD` | Outer/inner radius ratio | radial veh, fetkovich |
-| `ro` | Reservoir radius | radial |
-| `theta` | Encroachment angle | radial |
-| `h` | Aquifer thickness | veh, fetkovich |
-| `phi` | Aquifer porosity | veh, fetkovich |
-| `k` | Aquifer permeability | veh, fetkovich |
-| `L`, `w` | Linear aquifer length and width | linear |
-
-Anything not listed in `fit` stays fixed at the value you gave. For a gas tank pass `fluid="gas"` and `temp_f`. PVT is interpolated from the table's own columns unless you pass `pvt=BlackOilPVT(...)`.
-
-Several aquifer properties change the response in the same way: thickness and encroachment angle only scale its strength, for instance. Regressing on them together fits the pressures but their individual values are not unique; `match.warnings` says when that happens.
-
-In the Streamlit app, choose **Analytical (pressure match)** under Method on the Oil or Gas page.
-
-## Gas reservoir
-
-Required columns: `p, z, Gp`. Optional: `t, Wp, Bw`.
-
-```python
-from resmb import gas_mbe
-
-result = gas_mbe(data, temp_f=220, Swi=0.25, cw=3e-6, cf=0.0, pz_abandon=500)
-print(result.G_pz)        # gas in place from the p/z line, Bscf
-print(result.in_place)    # gas in place from Havlena–Odeh, Bscf
-print(result.Gp_abandon)  # recoverable at the abandonment p/z, Bscf
-```
-
-## PVT correlations
-
-```python
-from resmb import BlackOilPVT
-
-pvt = BlackOilPVT(api=35, gas_gravity=0.75, temp_f=200, rsb=600, correlation="standing")
-pvt.pb                        # bubble point, psia
-pvt.at(2500)                  # dict: Rs, Bo, co, mu_o, z, Bg, mu_g, Bw
-pvt.table(range(500, 4001, 500))
-data = pvt.fill(data)         # writes Bo, Rs, Bg, Bw and z from the 'p' column
-```
-
-Give either `rsb` or `pb`. `correlation` is `"standing"`, `"vasquez-beggs"` or `"glaso"`.
-
-| Property | Correlation |
-|---|---|
-| Bubble point, Rs, Bo | Standing, Vasquez–Beggs or Glasø |
-| Bo and oil viscosity above the bubble point | Vasquez–Beggs |
-| Dead and saturated oil viscosity | Beggs–Robinson |
-| Gas z-factor | Dranchuk–Abou-Kassem with Sutton pseudo-criticals |
-| Gas viscosity | Lee–Gonzalez–Eakin |
-| Bw | McCain, fresh water |
-
-Correlations typically carry 5–15% error. Use lab PVT where it exists.
-
-## Multi-tank
-
-Each tank has its own volume, aquifer and production table (`t, Np, Gp, Wp`, plus `p_obs` where a pressure was measured). Production tables do not include a row for day 0. Fluid properties come from a `BlackOilPVT`.
-
-```python
-from resmb import Tank, Connection, MultiTank
-
-tanks = [
-    Tank("Main block", in_place=75, pi=3200, Swi=0.22, cf=4e-6,
-         aquifer="fetkovich", Wei=9, J=10,
-         fit_in_place=True, fit_aquifer=True, production=main_df),
-    Tank("East block", in_place=40, pi=3200, Swi=0.22, cf=4e-6,
-         fit_in_place=True, production=east_df),
-]
-model = MultiTank(tanks, [Connection("Main block", "East block", T=3, fit=True)],
-                  pvt=pvt, cw=3e-6, max_step=30)
-
-run = model.simulate()        # run.pressure, run.influx, run.crossflow (DataFrames)
-match = model.history_match() # updates tanks and connections in place
-print(match["rms_before"], match["rms_after"], match["fitted"])
-```
-
-| `Tank.aquifer` | Parameters |
-|---|---|
-| `"none"` | |
-| `"pot"` | `C` |
-| `"fetkovich"` | `Wei` (MMbbl), `J` |
-| `"veh_radial"` | `C` (= B), `td_per_day`, `reD` |
-| `"veh_linear"` | `C` (= B), `td_per_day` |
-
-`fluid` is `"oil"` (default) or `"gas"`; `in_place` is MMSTB or Bscf accordingly.
-
-`history_match` adjusts every parameter flagged `fit_in_place`, `fit_aquifer` or `fit` to minimise the squared difference from `p_obs`.
-
-## Well data in Python
-
-```python
-import pandas as pd
-from resmb import build_history, BlackOilPVT, oil_mbe
-
-wells = pd.read_csv("well_production.csv")     # well, date, oil (STB), gas (Mscf), water (STB)
-surveys = pd.read_csv("pressure_surveys.csv")  # date, pressure
-
-h = build_history(wells, surveys, volumes="period", period_dates="end",
-                  reservoir="Sand A", group="Q", initial_pressure=None)
-print(h.attrs["notes"])                        # warnings, e.g. no survey at initial conditions
-
-h[["Np", "Wp"]] /= 1e6                         # STB  -> MMSTB
-h["Gp"] /= 1e3                                 # Mscf -> MMscf
-h = BlackOilPVT(api=35, gas_gravity=0.75, temp_f=200, rsb=600).fill(h)
-result = oil_mbe(h, Swi=0.2, m=0.3)
-```
-
-`aggregate_wells` returns the reservoir cumulatives on their own, and `reservoir_table` picks one reservoir out of a multi-reservoir history file.
-
-## Limitations
-
-- **Matches are not unique.** Fitting tank size and aquifer strength together can give a good pressure match with the wrong values, because a smaller tank with a stronger aquifer behaves much like a larger tank with a weaker one. Fix what you know independently and fit the rest.
-- **A good fit does not prove an aquifer exists.** Fitting an aquifer to a volumetric reservoir returns meaningless aquifer values. Check the Campbell plot (oil) or Cole plot (gas) first.
-- **Crossflow between tanks is reservoir volume only.** The simulator does not track how much of the transferred volume is oil and how much is gas.
-- **One PVT description for all tanks** in a `MultiTank` model.
-- **Pressure surveys are averaged with equal weight.** Surveys from different wells are not weighted by volume or datum-corrected; do that before loading them.
-- **Dry gas only** in `gas_mbe`; no condensate or abnormal-pressure correction.
+* Single-phase Z: Dranchuk-Abou-Kassem, Sutton pseudo-criticals, Wichert-Aziz correction.
+* Two-phase Z: Rayes-Piper-McCain-Poston (1992), scaled to be continuous at the dew point.
+* Aquifer dimensionless functions (WD, pD) are computed by Stehfest inversion of the Laplace-space
+  solutions, so any re/ro can be used without table look-up.
+* Bottom drive is modelled as vertical linear flow through the reservoir area (kv = k * kv/kh).
+* Aquifer detection: quadratic trend test (F-test) on the Cole no-aquifer plot F/Et vs Gp.
 
 ## Files
 
-| File | Contents |
-|---|---|
-| `resmb.py` | The library |
-| `app.py` | Streamlit app |
-| `examples.py` | Five worked cases with charts |
-| `requirements.txt` | Dependencies |
+    app.py            Streamlit interface
+    mbal/pvt.py       PVT correlations and table handling
+    mbal/aquifer.py   aquifer models
+    mbal/matbal.py    material balance, graphical methods, drive detection
+    mbal/regress.py   regression
+    mbal/model.py     configuration -> engine objects
+    mbal/sample.py    synthetic sample case
+    tests/            engine checks:  python tests/test_engine.py
