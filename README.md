@@ -7,7 +7,8 @@ Material balance tool for retrograde gas-condensate reservoirs (oil and dry-gas 
     pip install -r requirements.txt
     streamlit run app.py
 
-The app opens in your browser with a synthetic sample case loaded
+The app opens in your browser with every input empty. Each tab lists what it still needs.
+"Load sample case" in the sidebar loads a synthetic case
 (250 Bscf wet gas, finite radial aquifer with re/ro = 5 and k = 40 md).
 
 ## Workflow

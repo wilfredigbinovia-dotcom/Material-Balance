@@ -82,27 +82,50 @@ def load_sample():
     refresh()
 
 
+FALLBACK = default_config()      # only ever used for inputs the selected model does not need
+
+
+def blank_config():
+    """Every number box empty; only the option selectors keep a setting."""
+    c = {k: (None if isinstance(v, (int, float)) and not isinstance(v, bool) else v)
+         for k, v in FALLBACK.items()}
+    c.update(start_date=None, hist_mode="By reservoir")
+    return c
+
+
+def cfg():
+    """Input values for the engine. Empty boxes the current model does not use are filled
+    with a placeholder; boxes it does use are checked before the engine is called."""
+    return {k: (FALLBACK.get(k) if v is None else v) for k, v in V.items()}
+
+
+def missing(keys):
+    """Labels of the required inputs that are still empty."""
+    return [LABELS.get(k, k) for k in keys if V.get(k) is None]
+
+
+LABELS = {}     # key -> label, filled as the number boxes are drawn
+
+
 def load_blank():
-    c = default_config()
-    c.update(start_date=dt.date.today().replace(month=1, day=1), hist_mode="By reservoir")
-    ss.vals = c
+    ss.vals = blank_config()
     ss.cur = {k: empty_table(k) for k in TABLES}
     refresh()
 
 
 def project_json():
     v = dict(ss.vals)
-    v["start_date"] = str(v["start_date"])
+    v["start_date"] = None if v["start_date"] is None else str(v["start_date"])
     tabs = {k: json.loads(d.to_json(orient="split", date_format="iso")) for k, d in ss.cur.items()}
     return json.dumps({"app": "condensate-mbal", "version": 1, "vals": v, "tables": tabs}, indent=1)
 
 
 def load_project(raw):
     d = json.loads(raw)
-    v = default_config()
-    v.update(start_date=dt.date.today(), hist_mode="By reservoir")
+    v = blank_config()
     v.update(d["vals"])
-    v["start_date"] = dt.date.fromisoformat(str(v["start_date"])[:10])
+    v["start_date"] = (dt.date.fromisoformat(str(v["start_date"])[:10])
+                       if v["start_date"] not in (None, "None", "") else None)
     cur = {}
     for k in TABLES:
         t = d["tables"].get(k)
@@ -116,7 +139,7 @@ def load_project(raw):
 
 if "vals" not in ss:
     ss.ver = 0
-    load_sample()
+    load_blank()
 
 V = ss.vals
 
@@ -142,8 +165,8 @@ with st.sidebar:
         except Exception as e:  # noqa: BLE001
             st.error(f"Could not read that project file: {e}")
     st.divider()
-    st.caption("Work through the tabs from left to right. The sample case is synthetic: "
-               "250 Bscf wet gas with a finite radial aquifer, and two deliberately bad "
+    st.caption("Work through the tabs from left to right. The app starts empty; the sample "
+               "case is synthetic: 250 Bscf wet gas with a finite radial aquifer, and two deliberately bad "
                "pressure surveys to try the screening on.")
 
 KEY = f"{SYS}_{ss.ver}"
@@ -157,17 +180,26 @@ def ulabel(text, q):
 
 
 def num(label, key, q=None, where=st, step=None, minv=None, maxv=None, fmt="%.6g", help=None):
-    disp = float(U.to_disp(q, V[key], SYS))
+    LABELS[key] = label
+    disp = None if V[key] is None else float(U.to_disp(q, V[key], SYS))
     kw = {}
     if minv is not None:
         kw["min_value"] = float(U.to_disp(q, minv, SYS))
-        disp = max(disp, kw["min_value"])
+        disp = None if disp is None else max(disp, kw["min_value"])
     if maxv is not None:
         kw["max_value"] = float(U.to_disp(q, maxv, SYS))
-        disp = min(disp, kw["max_value"])
+        disp = None if disp is None else min(disp, kw["max_value"])
     val = where.number_input(ulabel(label, q), value=disp, key=f"n_{key}_{KEY}", step=step,
-                             format=fmt, help=help, **kw)
-    V[key] = float(U.from_disp(q, val, SYS))
+                             format=fmt, help=help, placeholder="", **kw)
+    V[key] = None if val is None else float(U.from_disp(q, val, SYS))
+    return V[key]
+
+
+def peek(key, q):
+    """Current value of a number box that is drawn further down the page."""
+    wkey = f"n_{key}_{KEY}"
+    if wkey in ss:
+        return None if ss[wkey] is None else float(U.from_disp(q, ss[wkey], SYS))
     return V[key]
 
 
@@ -309,20 +341,27 @@ with t_pvt:
     num("Condensate gravity", "api", "api", c[3], step=1.0, minv=10.0, maxv=90.0)
     c = st.columns(4)
     num("Separator gas gravity (air = 1)", "sg", None, c[0], step=0.01, minv=0.55, maxv=1.8)
-    num("CO₂ (mole fraction)", "co2", None, c[1], step=0.01, minv=0.0, maxv=0.9)
-    num("H₂S (mole fraction)", "h2s", None, c[2], step=0.01, minv=0.0, maxv=0.9)
-    num("N₂ (mole fraction)", "n2", None, c[3], step=0.01, minv=0.0, maxv=0.9)
+    none_ok = "Leave empty if there is none."
+    num("CO₂ (mole fraction)", "co2", None, c[1], step=0.01, minv=0.0, maxv=0.9, help=none_ok)
+    num("H₂S (mole fraction)", "h2s", None, c[2], step=0.01, minv=0.0, maxv=0.9, help=none_ok)
+    num("N₂ (mole fraction)", "n2", None, c[3], step=0.01, minv=0.0, maxv=0.9, help=none_ok)
 
-    SG_WET = wet_gas_gravity(V["sg"], V["cgr_i"], V["api"])
-    GE = gas_equivalent(V["api"])
-    sg_o, mw_o = condensate_props(V["api"])
+    INERTS = [V[k] or 0.0 for k in ("co2", "h2s", "n2")]
+    FLUID_MISS = missing(["T", "pd", "cgr_i", "api", "sg"])
     c = st.columns(4)
-    c[0].metric("Well-stream gas gravity", f"{SG_WET:.3f}")
-    c[1].metric("Condensate gas equivalent",
-                f"{GE if SYS == 'field' else GE * 0.0283168 / 0.158987:,.0f} "
-                f"{'scf/STB' if SYS == 'field' else 'sm³/sm³'}")
-    c[2].metric("Condensate specific gravity", f"{sg_o:.3f}")
-    c[3].metric("Condensate molecular weight", f"{mw_o:.0f}")
+    if FLUID_MISS:
+        SG_WET = GE = None
+        st.info("Enter the fluid description: " + ", ".join(FLUID_MISS).lower() + ".")
+    else:
+        SG_WET = wet_gas_gravity(V["sg"], V["cgr_i"], V["api"])
+        GE = gas_equivalent(V["api"])
+        sg_o, mw_o = condensate_props(V["api"])
+        c[0].metric("Well-stream gas gravity", f"{SG_WET:.3f}")
+        c[1].metric("Condensate gas equivalent",
+                    f"{GE if SYS == 'field' else GE * 0.0283168 / 0.158987:,.0f} "
+                    f"{'scf/STB' if SYS == 'field' else 'sm³/sm³'}")
+        c[2].metric("Condensate specific gravity", f"{sg_o:.3f}")
+        c[3].metric("Condensate molecular weight", f"{mw_o:.0f}")
 
     st.subheader("Z-factor table")
     left, right = st.columns([2, 3])
@@ -343,9 +382,11 @@ with t_pvt:
             def _fill_pvt():
                 sync_tables()
                 ss.cur["pvt"] = correlation_table(V["sg"], V["cgr_i"], V["api"], V["T"], V["pd"],
-                                                  V["pvt_pmax"], V["co2"], V["h2s"], V["n2"], V["z2"])
+                                                  V["pvt_pmax"], *INERTS, V["z2"])
                 refresh()
-            st.button("Generate table (replaces current table)", on_click=_fill_pvt)
+            st.button("Generate table (replaces current table)", on_click=_fill_pvt,
+                      disabled=bool(FLUID_MISS) or V["pvt_pmax"] is None,
+                      help="Needs the fluid description above and the maximum table pressure.")
         with st.expander("Calculate two-phase Z from a CVD report"):
             st.caption("For reports that give retrograde liquid deposit, cumulative produced "
                        "fluid and the single-phase (equilibrium gas) Z instead of the two-phase "
@@ -353,10 +394,12 @@ with t_pvt:
                        "Rows above the dew point need only pressure and gas Z.")
             cvd_df = table("cvd", height=260)
             csv_upload("cvd", "", expander=False)
-            num("Gas Z-factor at the dew point (0 = take from the table)", "cvd_zd", None,
+            num("Gas Z-factor at the dew point (empty = take from the table)", "cvd_zd", None,
                 step=0.01, minv=0.0, maxv=3.0)
             CVD_OUT = None
-            if cvd_df["p"].notna().any():
+            if cvd_df["p"].notna().any() and V["pd"] is None:
+                st.info("Enter the dew point pressure under Fluid description first.")
+            elif cvd_df["p"].notna().any():
                 try:
                     CVD_OUT, zd_used, cvd_notes = cvd_two_phase_z(cvd_df, V["pd"], V["cvd_zd"] or None)
                     st.caption(f"Z2 = p / [(pd/Zd)(1 − Gp)] with pd = "
@@ -386,6 +429,8 @@ with t_pvt:
 
     PVT_OK, pvt = True, None
     try:
+        if FLUID_MISS:
+            raise ValueError("Enter the fluid description: " + ", ".join(FLUID_MISS).lower() + ".")
         pvt = PVT.from_frame(pvt_df, V["T"], V["api"], SG_WET)
     except Exception as e:  # noqa: BLE001
         PVT_OK = False
@@ -411,22 +456,25 @@ with t_pvt:
                             annotation_text="dew point", annotation_font_size=11)
                 with holder:
                     show(f, f"pvt_{k}")
-        else:
-            st.warning(PVT_ERR)
+        elif not FLUID_MISS:
+            st.info(PVT_ERR)
 
     st.subheader("Formation water")
     c = st.columns(4)
     num("Water formation volume factor", "bw", "fvf_w", c[0], step=0.01, minv=0.9, maxv=1.3)
     num("Water compressibility", "cw", "compress", c[1], step=0.1, minv=0.0)
     num("Water viscosity", "aq_muw", "visc", c[2], step=0.01, minv=0.01)
-    num("Water salinity", "salinity", "ppm", c[3], step=5000.0, minv=0.0)
+    num("Water salinity", "salinity", "ppm", c[3], step=5000.0, minv=0.0,
+        help="Only used by the estimate below. Empty counts as fresh water.")
 
     def _est_water():
-        bw, cw, mu = water_props(V["pi"], V["T"], V["salinity"])
+        bw, cw, mu = water_props(V["pi"], V["T"], V["salinity"] or 0.0)
         V.update(bw=round(bw, 4), cw=float(f"{cw:.3g}"), aq_muw=round(mu, 3))
         refresh()
     st.button("Estimate water properties from correlations", on_click=_est_water,
-              help="McCain Bw, Osif cw, Beggs-Brill viscosity at initial pressure and temperature.")
+              disabled=V["T"] is None or V["pi"] is None,
+              help="McCain Bw, Osif cw, Beggs-Brill viscosity at initial pressure (tab 3) and "
+                   "reservoir temperature; both must be entered first.")
 
 # ============================================================ 2. Production history
 with t_prod:
@@ -508,7 +556,10 @@ with t_prod:
 
     HIST_OK, hist = True, None
     try:
-        hist = build_history(hist_df, V["start_date"], V["pi"])
+        if V["start_date"] is None:
+            raise ValueError("Enter the start of production date.")
+        pi_now = peek("pi", "pressure")
+        hist = build_history(hist_df, V["start_date"], np.nan if pi_now is None else pi_now)
     except Exception as e:  # noqa: BLE001
         HIST_OK, HIST_ERR = False, str(e)
 
@@ -526,7 +577,7 @@ with t_prod:
             f = figure("", f"Cumulative gas ({U.label('gas_ip', SYS)})", height=250)
             f.add_trace(go.Scatter(x=dates, y=gas_ip(hist.gp), mode="lines",
                                    line=dict(color=BLUE, width=2), name="Separator gas"))
-            if PVT_OK:
+            if GE is not None:
                 f.add_trace(go.Scatter(x=dates, y=gas_ip(hist.gp + GE * hist.np_), mode="lines",
                                        line=dict(color=ORANGE, width=2), name="Wet gas equivalent"))
             show(f, "h_g")
@@ -564,11 +615,16 @@ with t_res:
         V["cf"] = float(f"{hall_cf(V['phi']):.3g}")
         refresh()
     c[2].write("")
-    c[2].button("Estimate rock compressibility (Hall)", on_click=_hall)
-    if V["pi"] < V["pd"]:
+    c[2].button("Estimate rock compressibility (Hall)", on_click=_hall, disabled=V["phi"] is None,
+                help="Needs the porosity.")
+    RES_MISS = missing(["pi", "swi", "cf", "G", "bw", "cw"])
+    if RES_MISS:
+        st.info("Still needed: " + ", ".join(RES_MISS).lower()
+                + (" (tab 1, Formation water)." if set(RES_MISS) <= {LABELS["bw"], LABELS["cw"]} else "."))
+    if V["pi"] is not None and V["pd"] is not None and V["pi"] < V["pd"]:
         st.warning("Initial pressure is below the dew point: the reservoir starts two-phase. "
                    "The two-phase Z-factor must then apply from initial conditions.")
-    if PVT_OK:
+    if PVT_OK and not RES_MISS:
         lo, hi = pvt.p_range
         if V["pi"] > hi * 1.0001 or V["pi"] < lo:
             st.error(f"Initial pressure is outside the PVT table "
@@ -595,7 +651,8 @@ with t_res:
                     f"{U.to_disp('liq_cum', V['G'] * frac_dry * V['cgr_i'] / 1e3, SYS):,.1f}")
 
 # ============================================================ engine
-READY = PVT_OK and HIST_OK
+READY = PVT_OK and HIST_OK and not RES_MISS
+AQ_MISS = []
 if READY:
     lo, hi = pvt.p_range
     if V["pi"] > hi * 1.0001 or hist.p.min() < lo:
@@ -603,7 +660,7 @@ if READY:
                       "table limits. Extend the table in tab 1 for reliable results.")
     else:
         RANGE_WARN = None
-    tank0 = make_tank(V, pvt, hist, with_aquifer=False)
+    tank0 = make_tank(cfg(), pvt, hist, with_aquifer=False)
     DET = detect_drive(tank0)
     n_pts = len(hist.p)
     DATES = pd.Timestamp(V["start_date"]) + pd.to_timedelta(hist.t, unit="D")
@@ -632,6 +689,11 @@ def need_data():
         st.info(f"Complete the PVT data first. {PVT_ERR}")
     elif not HIST_OK:
         st.info(f"Complete the production history first. {HIST_ERR}")
+    elif RES_MISS:
+        st.info("Complete the reservoir parameters first: " + ", ".join(RES_MISS).lower() + ".")
+    elif AQ_MISS:
+        st.info("Complete the aquifer in tab 5 first: " + ", ".join(AQ_MISS).lower()
+                + ". Or set the aquifer model to none.")
 
 
 def detection_banner(short=False):
@@ -699,7 +761,8 @@ def aquifer_inputs():
     num("Aquifer porosity", "aq_phi", "frac", c[2], step=0.01, minv=0.01, maxv=0.6)
     st.caption(f"Aquifer total compressibility = cw + cf = "
                f"{U.to_disp('compress', V['cw'] + V['cf'], SYS):.2f} {U.label('compress', SYS)}; "
-               f"water viscosity {V['aq_muw']:.3g} cp (tab 1)."
+               "water viscosity " + ("not entered" if V["aq_muw"] is None else f"{V['aq_muw']:.3g} cp")
+               + " (tab 1)."
                + (" Bottom drive is modelled as vertical linear flow through the reservoir area."
                   if g == "bottom" else ""))
 
@@ -730,9 +793,15 @@ with t_aq:
             if DET["status"] == "aquifer" and V["aq_model"] == "none":
                 st.markdown("Select the aquifer model and system below, then enter its parameters.")
             aquifer_inputs()
+            _inf = bool(V["aq_inf"]) and V["aq_model"] != "fetkovich"
+            AQ_MISS = missing(aquifer_params(V["aq_model"], V["aq_geom"], _inf)
+                              + (["aq_phi", "aq_muw"] if V["aq_model"] in NEEDS_GEOMETRY else []))
+            if AQ_MISS:
+                st.info("Still needed for this aquifer: " + ", ".join(AQ_MISS).lower() + ".")
 
+READY = READY and not AQ_MISS
 if READY:
-    tank = make_tank(V, pvt, hist)
+    tank = make_tank(cfg(), pvt, hist)
     P_SIM, WE_SIM = tank.simulate()
     WE_HIST = tank.We_history()
     RMS = pressure_rms(P_SIM, hist.p, hist.w)
@@ -1170,7 +1239,7 @@ with t_reg:
                     elif len(rk) >= N_ON:
                         left.error("More parameters than active pressure surveys.")
                     else:
-                        base = dict(V)
+                        base = cfg()
                         sim = make_sim(base, rk)
                         with st.spinner("Regressing..."):
                             r = regress(sim, hist.p, x0, lo_, hi_, hist.w, LOSSES[loss_lab])
