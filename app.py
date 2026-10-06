@@ -25,6 +25,15 @@ from mbal.sample import default_config, sample_case
 st.set_page_config(page_title="Condensate Material Balance", page_icon="🛢️", layout="wide")
 ss = st.session_state
 
+# Number boxes: no -/+ step buttons (values are typed in).
+st.markdown("""<style>
+[data-testid="stNumberInputStepUp"], [data-testid="stNumberInputStepDown"],
+[data-testid="stNumberInput"] button {display: none !important;}
+[data-testid="stNumberInput"] input {-moz-appearance: textfield;}
+[data-testid="stNumberInput"] input::-webkit-outer-spin-button,
+[data-testid="stNumberInput"] input::-webkit-inner-spin-button {-webkit-appearance: none; margin: 0;}
+</style>""", unsafe_allow_html=True)
+
 BLUE, ORANGE, AQUA, YELLOW, GREY = "#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#8a8a85"
 RED = "#e34948"
 SURVEY = [("use", "Use", "bool"), ("w", "Weight", "weight")]   # pressure survey on/off and weight
