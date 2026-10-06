@@ -15,6 +15,8 @@ The app opens in your browser with a synthetic sample case loaded
 1. **PVT data** - fluid description and Z-factor table (lab CVD table, CSV import, or correlations).
    If the CVD report has no two-phase Z, it is calculated from the cumulative produced fluid (see Method).
 2. **Production history** - cumulative gas, condensate, water and reservoir pressure, by reservoir or by well.
+   An Excel or CSV workbook (production sheet and pressure sheet, columns found by their headings) can be
+   imported directly; pressures of several wells on the same date are averaged.
 3. **Reservoir parameters** - initial pressure, porosity, connate water, rock compressibility, first estimate of gas in place.
 4. **History match** - graphical plots (p/z, p/z overpressured, Havlena-Odeh overpressured, Havlena-Odeh water drive,
    Cole (F-We)/Et, Roach, Cole F/Et), analytical plot (pressure vs cumulative production), energy plot, WD function plot.
@@ -71,6 +73,7 @@ G is the wet (well-stream) gas initially in place.
     mbal/matbal.py    material balance, graphical methods, drive detection
     mbal/regress.py   regression (weights, robust loss, leave-one-out)
     mbal/outliers.py  survey screening statistics
+    mbal/importer.py  production / pressure workbook import
     mbal/model.py     configuration -> engine objects
     mbal/sample.py    synthetic sample case
     tests/            engine checks:  python tests/test_engine.py

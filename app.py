@@ -14,6 +14,7 @@ import streamlit as st
 from mbal import units as U
 from mbal.aquifer import GEOMETRIES, MODELS, NEEDS_GEOMETRY, WD
 from mbal.matbal import METHODS, aggregate_wells, build_history, detect_drive, graphical
+from mbal.importer import parse_workbook, reservoir_tables
 from mbal.model import PARAMS, aquifer_params, make_aquifer, make_tank
 from mbal.pvt import (PVT, condensate_props, correlation_table, cvd_two_phase_z, gas_equivalent, hall_cf,
                       water_props, wet_gas_gravity)
@@ -430,6 +431,51 @@ with t_prod:
     st.caption("All volumes are cumulative. Gas is separator (dry) gas; the tool converts "
                "condensate to its gas equivalent to obtain wet-gas production. Untick **Use** to "
                "switch a pressure survey off; tab 6 can suggest which ones to review.")
+    with st.expander("Import a production and pressure workbook (Excel or CSV)"):
+        st.caption("One sheet with Date and cumulative Gas, Condensate and Water, and one with Date "
+                   "and Pressure. Reservoir and Well columns are optional. Columns are found by "
+                   "their headings, in any order; values must be in the units selected in the "
+                   f"sidebar ({U.label('gas_cum', SYS)}, {U.label('liq_cum', SYS)}, {PU}). "
+                   "Pressures of several wells on the same date are averaged.")
+        wb = st.file_uploader("Workbook", type=["xlsx", "xlsm", "xls", "csv", "txt"], key="up_wb")
+        if wb is not None:
+            try:
+                if ss.get("wb_id") != wb.file_id:
+                    ss.wb_data = parse_workbook(wb.getvalue(), wb.name)
+                    ss.wb_id = wb.file_id
+                wprod, wpres = ss.wb_data
+                names = sorted(wprod["reservoir"].unique())
+                res_pick = st.selectbox("Reservoir", names, key="wb_res") if len(names) > 1 else names[0]
+                WB = reservoir_tables(wprod, wpres, res_pick)
+                st.write(f"**{res_pick}**: {WB['wells']['well'].nunique()} well(s), "
+                         f"{len(WB['wells'])} production rows, {len(WB['pres'])} survey dates. "
+                         f"Start of production will be set to {WB['start_date']}.")
+                if len(WB["pre_start"]):
+                    st.info("Surveys before production started (use as initial pressure in tab 3): "
+                            + "; ".join(f"{U.to_disp('pressure', r.p, SYS):,.6g} {PU} on {r.date:%Y-%m-%d}"
+                                        for r in WB["pre_start"].itertuples()))
+                wide = WB["spread"][WB["spread"]["n"] > 1].sort_values("range", ascending=False)
+                if len(wide) and wide["range"].iloc[0] > 50.0:
+                    r = wide.iloc[0]
+                    st.warning(f"Wells disagree by {U.to_disp('pressure', r['range'], SYS):,.0f} {PU} on "
+                               f"{r['date']:%Y-%m-%d}. The average is used; correct it in the survey "
+                               "table if one of the wells is not representative.")
+                for m in WB["notes"]:
+                    st.warning(m)
+
+                def _use_wb():
+                    sync_tables()
+                    wl, pr = WB["wells"].copy(), WB["pres"].copy()
+                    wl["gp"] = U.from_disp("gas_cum", wl["gp"], SYS)
+                    for k in ("np", "wp"):
+                        wl[k] = U.from_disp("liq_cum", wl[k], SYS)
+                    pr["p"] = U.from_disp("pressure", pr["p"], SYS)
+                    ss.cur["wells"], ss.cur["pres"] = wl, pr
+                    V["hist_mode"], V["start_date"] = "By well", WB["start_date"]
+                    refresh()
+                st.button("Load into the tables (replaces current history)", on_click=_use_wb)
+            except Exception as e:  # noqa: BLE001
+                st.warning(f"Could not read the workbook: {e}")
     if mode == "By reservoir":
         left, right = st.columns([3, 3])
         with left:

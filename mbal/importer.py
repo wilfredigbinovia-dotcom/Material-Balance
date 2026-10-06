@@ -1,0 +1,112 @@
+"""Read a production / pressure workbook (Excel or CSV) by its column headings."""
+import io
+import numpy as np
+import pandas as pd
+
+# column -> words looked for in the heading (first match wins, checked in this order)
+KEYS = [("reservoir", ("reservoir", "tank", "sand")), ("well", ("well", "string", "completion")),
+        ("date", ("date", "month", "time")), ("p", ("press", "psi", "bar")),
+        ("gp", ("gas",)), ("np", ("cond", "oil", "liquid")), ("wp", ("water", "wat"))]
+
+
+def _columns(df):
+    """Map recognised headings to standard names; unrecognised columns are dropped."""
+    out, used = {}, set()
+    for name, words in KEYS:
+        for col in df.columns:
+            h = str(col).strip().lower()
+            if col not in used and any(w in h for w in words):
+                out[name] = col
+                used.add(col)
+                break
+    d = df[list(out.values())].copy()
+    d.columns = list(out)
+    return d
+
+
+def read_sheets(raw, filename):
+    """bytes -> list of DataFrames with standard column names."""
+    if filename.lower().endswith((".xlsx", ".xlsm", ".xls")):
+        sheets = pd.read_excel(io.BytesIO(raw), sheet_name=None)
+    else:
+        sheets = {"csv": pd.read_csv(io.BytesIO(raw), sep=None, engine="python")}
+    return [_columns(s.dropna(how="all")) for s in sheets.values() if len(s.columns)]
+
+
+def parse_workbook(raw, filename):
+    """Returns (production, pressures) long tables.
+
+    production: reservoir, well, date, gp, np, wp     (cumulative, as in the file)
+    pressures:  reservoir, well, date, p
+    A sheet with a gas column is production; a sheet with a pressure column is pressure
+    (one sheet may be both). Missing reservoir / well columns are filled with a single name.
+    """
+    prod, pres = [], []
+    for d in read_sheets(raw, filename):
+        if "date" not in d:
+            continue
+        d["date"] = pd.to_datetime(d["date"], errors="coerce")
+        d = d.dropna(subset=["date"])
+        for k, default in (("reservoir", "Reservoir"), ("well", "Reservoir")):
+            d[k] = d[k].astype(str).str.strip() if k in d else default
+        for k in ("gp", "np", "wp", "p"):
+            if k in d:
+                d[k] = pd.to_numeric(d[k], errors="coerce")
+        if "gp" in d:
+            x = d.dropna(subset=["gp"]).copy()
+            for k in ("np", "wp"):
+                x[k] = x[k].fillna(0.0) if k in x else 0.0
+            prod.append(x[["reservoir", "well", "date", "gp", "np", "wp"]])
+        if "p" in d:
+            pres.append(d.dropna(subset=["p"])[["reservoir", "well", "date", "p"]])
+    if not prod:
+        raise ValueError("No production sheet found: it needs a Date column and a Gas column.")
+    if not pres:
+        raise ValueError("No pressure sheet found: it needs a Date column and a Pressure column.")
+    return pd.concat(prod, ignore_index=True), pd.concat(pres, ignore_index=True)
+
+
+def reservoir_tables(prod, pres, reservoir):
+    """Tables for one reservoir, ready for the By-well input.
+
+    Returns dict(wells, pres, start_date, pre_start, spread, notes):
+      wells      well, date, gp, np, wp
+      pres       date, p (mean of the wells surveyed on that date), use, w
+      start_date one reporting period before the first production record
+      pre_start  surveys taken before production started (candidates for initial pressure)
+      spread     per date: number of wells surveyed and max - min pressure
+    """
+    w = prod[prod["reservoir"] == reservoir].sort_values(["well", "date"])
+    s = pres[pres["reservoir"] == reservoir]
+    if w.empty:
+        raise ValueError(f"No production rows for reservoir {reservoir}.")
+    notes = []
+    first = w["date"].min()
+    gaps = w.groupby("well")["date"].diff().dropna()
+    step = gaps.median() if len(gaps) else pd.Timedelta(days=30)
+    # Monthly cumulatives stamped on the first of the month: back off one calendar month.
+    if w["date"].dt.day.eq(1).all() and pd.Timedelta(days=27) <= step <= pd.Timedelta(days=32):
+        start = first - pd.DateOffset(months=1)
+    else:
+        start = first - step
+    if float(w.loc[w["date"] == first, "gp"].sum()) <= 0:
+        start = first
+    falling = [k for k, g in w.groupby("well") if (g["gp"].diff() < -1e-9).any()]
+    if falling:
+        notes.append("Gas does not rise continuously for " + ", ".join(falling) + ": the file "
+                     "must hold cumulative volumes, not monthly volumes or rates.")
+    g = s.groupby("date")["p"]
+    avg = g.mean().reset_index().sort_values("date")
+    spread = pd.DataFrame({"date": avg["date"].to_numpy(), "n": g.count().to_numpy(),
+                           "range": (g.max() - g.min()).to_numpy()})
+    pre = avg[avg["date"] <= start]
+    late = avg[avg["date"] > w["date"].max()]
+    if len(late):
+        notes.append(f"{len(late)} survey(s) are dated after the last production record "
+                     f"({w['date'].max():%Y-%m-%d}); cumulative production is held constant "
+                     "to those dates.")
+    surveys = avg[avg["date"] > start].copy()
+    surveys["use"], surveys["w"] = True, 1.0
+    return dict(wells=w[["well", "date", "gp", "np", "wp"]].reset_index(drop=True),
+                pres=surveys.reset_index(drop=True), start_date=pd.Timestamp(start).date(),
+                pre_start=pre.reset_index(drop=True), spread=spread, notes=notes)
