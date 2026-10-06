@@ -110,3 +110,39 @@ def reservoir_tables(prod, pres, reservoir):
     return dict(wells=w[["well", "date", "gp", "np", "wp"]].reset_index(drop=True),
                 pres=surveys.reset_index(drop=True), start_date=pd.Timestamp(start).date(),
                 pre_start=pre.reset_index(drop=True), spread=spread, notes=notes)
+
+
+TEST_KEYS = [("well", ("well", "string", "completion")), ("date", ("date", "time")),
+             ("pwf", ("bhp", "pwf", "bottom", "downhole", "gauge")),
+             ("pth", ("thp", "whp", "tubing", "wellhead", "well head", "pth", "head")),
+             ("pr", ("reservoir", "static", "shut", "average")),
+             ("qg", ("gas", "rate", "qg"))]
+
+
+def read_tests(raw, filename):
+    """Well tests from Excel or CSV by column heading -> well, date, qg, pwf, pth, pr."""
+    if filename.lower().endswith((".xlsx", ".xlsm", ".xls")):
+        sheets = list(pd.read_excel(io.BytesIO(raw), sheet_name=None).values())
+    else:
+        sheets = [pd.read_csv(io.BytesIO(raw), sep=None, engine="python")]
+    out = []
+    for df in sheets:
+        cols, used = {}, set()
+        for name, words in TEST_KEYS:
+            for col in df.columns:
+                if col not in used and any(w in str(col).strip().lower() for w in words):
+                    cols[name] = col
+                    used.add(col)
+                    break
+        if "qg" not in cols or not ({"pwf", "pth"} & set(cols)):
+            continue
+        d = pd.DataFrame({k: df[v] for k, v in cols.items()})
+        d["well"] = d["well"].astype(str).str.strip() if "well" in d else "Well"
+        d["date"] = pd.to_datetime(d["date"], errors="coerce") if "date" in d else pd.NaT
+        for k in ("qg", "pwf", "pth", "pr"):
+            d[k] = pd.to_numeric(d[k], errors="coerce") if k in d else np.nan
+        out.append(d.dropna(subset=["qg"])[["well", "date", "qg", "pwf", "pth", "pr"]])
+    if not out:
+        raise ValueError("No well test sheet found: it needs a gas rate column and a flowing "
+                         "bottomhole or tubing-head pressure column.")
+    return pd.concat(out, ignore_index=True)

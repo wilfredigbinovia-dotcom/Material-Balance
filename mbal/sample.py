@@ -24,7 +24,10 @@ def default_config():
              aq_model="none", aq_geom="radial", aq_inf=False,
              aq_ro=6000.0, aq_reD=4.0, aq_h=80.0, aq_theta=120.0, aq_k=100.0, aq_phi=0.20,
              aq_muw=round(mu, 3), aq_width=8000.0, aq_L=30000.0, aq_kvkh=0.1,
-             aq_Wvol=500.0, aq_C=50.0)
+             aq_Wvol=500.0, aq_C=50.0,
+             rp_sgrw=0.25, rp_krw=0.3, rp_krg=1.0, rp_nw=3.0, rp_ng=2.0,
+             rp_soc=0.2, rp_no=3.0, rp_ngo=2.0, rp_vap=True,
+             fc_years=15.0, fc_step="Monthly", fc_qtarget=45.0, fc_qmin=3.0)
     return c
 
 
@@ -78,3 +81,43 @@ def sample_case(seed=7, bad=True):
     hist["use"], hist["w"] = True, 1.0
     pressures = hist[["date", "p", "use", "w"]].copy()
     return c, tab, hist, wells, pressures, start.date()
+
+
+def sample_wells(hist, c=None):
+    """Well tests and completion data for the three sample wells.
+
+    Each well has a three-rate test early in life (bottomhole gauge) and a single later test
+    reported at the tubing head, so both routes to a flowing bottomhole pressure are shown.
+    The tests are generated from the true model (TRUTH) with the typical relative
+    permeability curves, so they are fitted exactly once the history is matched."""
+    from scipy.optimize import brentq
+    from .matbal import build_history
+    from .pvt import GasZ
+    from .relperm import RelPerm, TankState
+    from .wells import Well, tubing_bhp
+    c = c or default_config()
+    sgw = wet_gas_gravity(c["sg"], c["cgr_i"], c["api"])
+    pvt = PVT.from_frame(sample_pvt_table(c), c["T"], c["api"], sgw)
+    h = build_history(hist, hist["date"].iloc[0] - pd.DateOffset(months=6), c["pi"])
+    tank = make_tank(dict(c, aq_model="veh", **TRUTH), pvt, h)
+    p, we = tank.simulate()
+    state = TankState(tank, c["aq_muw"])
+    M = state.mobility(RelPerm(swc=c["swi"]), p, state.sw(p, we, h.wp))
+    gz = GasZ(sgw, c["co2"], c["h2s"], c["n2"])
+    tests, cfg = [], []
+    for name, share, tid in (("A-1", 0.45, 3.958), ("A-2", 0.35, 3.958), ("A-3", 0.20, 2.992)):
+        w = Well(name, C=share * 60.0 / 9.6e6 ** 0.8, n=0.8, tvd=12000.0, md=12600.0, tid=tid, wht=140.0)
+        cfg.append(dict(well=name, tvd=w.tvd, md=w.md, tid=tid, wht=w.wht, min_thp=400.0,
+                        min_bhp=np.nan, qmax=np.nan))
+        for k, fracs, gauge in ((3, (0.5, 0.8, 1.1), True), (7, (0.9,), False)):
+            pr, m = p[k], M[k]
+            wet = 1.0 + pvt.ge * float(pvt.cgr(pr)) / 1e6
+            for frac in fracs:
+                q = share * 52.0 * frac
+                pwf = np.sqrt(pr ** 2 - (q / w.C) ** (1 / w.n) / m)
+                pth = brentq(lambda x: tubing_bhp(x, q, gz, c["T"], w, wet) - pwf, 20.0, pwf)
+                tests.append(dict(well=name, date=hist["date"].iloc[k - 1], qg=round(q, 2),
+                                  pwf=round(pwf, 0) if gauge else np.nan,
+                                  pth=np.nan if gauge else round(pth, 0),
+                                  pr=round(pr, 0) if gauge else np.nan))
+    return pd.DataFrame(tests), pd.DataFrame(cfg)

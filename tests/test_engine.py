@@ -165,6 +165,105 @@ def test_cvd_two_phase_z():
     assert np.allclose(o2["z"], out["z"][2:])
 
 
+def _sample_forecast_setup(aquifer=True):
+    from mbal.pvt import GasZ
+    from mbal.relperm import RelPerm, TankState
+    from mbal.sample import sample_wells
+    from mbal.wells import Well, fit_ipr, tubing_bhp
+    c, tab, hist_df, wells, pres, start = sample_case(bad=False)
+    pvt = PVT.from_frame(tab, c["T"], c["api"], wet_gas_gravity(c["sg"], c["cgr_i"], c["api"]))
+    h = build_history(hist_df, start, c["pi"])
+    tank = make_tank(dict(c, aq_model="veh", **TRUTH) if aquifer else dict(c, G=TRUTH["G"]), pvt, h)
+    p, we = tank.simulate()
+    rp = RelPerm(swc=c["swi"])
+    state = TankState(tank, c["aq_muw"])
+    gz = GasZ(pvt.sg_wet, c["co2"], c["h2s"], c["n2"])
+    tests, cfg = sample_wells(hist_df, c)
+    return c, pvt, h, tank, p, we, rp, state, gz, tests, cfg, hist_df
+
+
+def test_tubing_and_inflow_fit():
+    from mbal.pvt import GasZ, water_vapour
+    from mbal.wells import Well, fit_ipr, tubing_bhp, well_rate
+    gz = GasZ(0.7)
+    w = Well("x", tvd=10000.0, tid=2.441, wht=120.0)
+    static = tubing_bhp(2000.0, 0.0, gz, 220.0, w)
+    # static column: p_bottom = p_top * exp(0.01875 * sg * TVD / (T z))
+    zbar = gz(0.5 * (2000 + static), 170.0)
+    assert abs(static - 2000.0 * np.exp(0.01875 * 0.7 * 10000 / (629.67 * zbar))) < 2.0
+    flowing = tubing_bhp(2000.0, 10.0, gz, 220.0, w)
+    assert 300 < flowing - static < 500                 # hand calculation: about 340-400 psi of friction
+    assert tubing_bhp(2000.0, 20.0, gz, 220.0, w) > flowing
+    # inflow fit recovers C and n from exact data, and one test falls back to n = 1
+    x = np.array([1e6, 3e6, 6e6])
+    C, n, _ = fit_ipr(2e-5 * x ** 0.8, x)
+    assert abs(n - 0.8) < 1e-6 and abs(C / 2e-5 - 1) < 1e-6
+    assert fit_ipr([5.0], [1e6])[1] == 1.0
+    # rate at a tubing-head limit satisfies inflow and tubing together, and falls with pressure
+    w.C, w.n, w.min_thp = C, n, 800.0
+    q, pwf = well_rate(w, 4000.0, 1.0, gz, 220.0)
+    assert abs(q - C * (4000.0 ** 2 - pwf ** 2) ** n) < 1e-3
+    assert abs(pwf - tubing_bhp(800.0, q, gz, 220.0, w)) < 1.0
+    assert well_rate(w, 3000.0, 1.0, gz, 220.0)[0] < q
+    assert well_rate(w, 900.0, 1.0, gz, 220.0)[0] == 0.0          # cannot lift against the limit
+    assert well_rate(w, 4000.0, 0.5, gz, 220.0)[0] < q            # lower mobility, lower rate
+    assert 0.5 < water_vapour(3000.0, 200.0) < 1.2                # McKetta-Wehe chart: about 0.8 STB/MMscf
+
+
+def test_relperm_water_fit():
+    from mbal.relperm import RelPerm, fit_water, water_history
+    c, pvt, h, tank, p, we, rp, state, *_ = _sample_forecast_setup()
+    sw = state.sw(p, we, h.wp)
+    assert abs(sw[0] - c["swi"]) < 1e-9 and sw[-1] > sw[0] + 0.02     # the aquifer raises Sw
+    krw, krg = rp.gas_water([c["swi"], 1 - rp.sgrw])
+    assert krw[0] == 0 and krg[0] == rp.krg_max and krg[1] == 0 and krw[1] == rp.krw_max
+    # make a water history from known curves, then recover them
+    true = RelPerm(swc=c["swi"], krw_max=0.12, nw=2.2)
+    h.wp[:] = 0.0
+    for _ in range(6):                                   # Wp feeds back into Sw: iterate to consistency
+        h.wp[:] = water_history(state, true, p, we)["wp"]
+    got, info = fit_water(state, rp, p, we)
+    assert info["ok"]
+    fit = water_history(state, got, p, we)["wp"]
+    assert abs(fit[-1] / h.wp[-1] - 1) < 0.02
+    # with no aquifer the saturation does not move and the fit says so instead of inventing curves
+    c2, pvt2, h2, tank2, p2, we2, rp2, state2, *_ = _sample_forecast_setup(aquifer=False)
+    assert not fit_water(state2, rp2, p2, we2)[1]["ok"]
+
+
+def test_forecast():
+    import pandas as pd
+    from mbal.forecast import forecast
+    from mbal.wells import Well, fit_ipr, tubing_bhp
+    c, pvt, h, tank, p, we, rp, state, gz, tests, cfg, hist_df = _sample_forecast_setup()
+    wells = []
+    for r in cfg.itertuples():
+        w = Well(r.well, tvd=r.tvd, md=r.md, tid=r.tid, wht=r.wht, min_thp=r.min_thp)
+        t = tests[(tests.well == r.well) & tests.pwf.notna()]
+        m = np.interp((pd.to_datetime(t.date) - pd.Timestamp(hist_df.date.iloc[0])).dt.days + 181, h.t,
+                      state.mobility(rp, p, state.sw(p, we, h.wp)))
+        w.C, w.n, _ = fit_ipr(t.qg, m * (t.pr ** 2 - t.pwf ** 2))
+        assert abs(w.n - 0.8) < 0.02                      # the sample tests were built with n = 0.8
+        wells.append(w)
+    df, s = forecast(tank, p, we, wells, rp, state, gz, 20 * 365.25, q_target=45.0, q_min=3.0)
+    f = df[df.forecast]
+    assert len(f) > 12
+    assert np.allclose(df.p[:len(p)], p) and abs(df.gp.iloc[len(p) - 1] - h.gp[-1]) < 1
+    assert f.qg.max() <= 45.0 + 1e-6 and f.qg.iloc[-1] < f.qg.iloc[0]      # plateau, then decline
+    assert np.all(np.diff(df.gp) >= 0) and s["rf_wet"] < 1.0 and s["rf_wet"] > s["rf_hist"]
+    # every forecast point honours the material balance
+    i = len(df) - 1
+    gpw = df.gp[i] + pvt.ge * df.np[i]
+    lhs = tank.G * tank.Et(df.p[i]) + df.we[i]
+    assert abs(lhs - gpw * pvt.bg(df.p[i]) - df.wp[i] * tank.bw) / lhs < 1e-4
+    # well rates add up, and a tighter tubing-head limit recovers less
+    assert np.allclose(f[[f"q_{w.name}" for w in wells]].sum(axis=1), f.qg)
+    for w in wells:
+        w.min_thp = 1500.0
+    df2, s2 = forecast(tank, p, we, wells, rp, state, gz, 20 * 365.25, q_target=45.0, q_min=3.0)
+    assert s2["gp_end"] < s["gp_end"]
+
+
 if __name__ == "__main__":
     for k, v in list(globals().items()):
         if k.startswith("test_"):

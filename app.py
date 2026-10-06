@@ -14,13 +14,16 @@ import streamlit as st
 from mbal import units as U
 from mbal.aquifer import GEOMETRIES, MODELS, NEEDS_GEOMETRY, WD
 from mbal.matbal import METHODS, aggregate_wells, build_history, detect_drive, graphical
-from mbal.importer import parse_workbook, reservoir_tables
+from mbal.forecast import forecast
+from mbal.importer import parse_workbook, read_tests, reservoir_tables
 from mbal.model import PARAMS, aquifer_params, make_aquifer, make_tank
-from mbal.pvt import (PVT, condensate_props, correlation_table, cvd_two_phase_z, gas_equivalent, hall_cf,
+from mbal.pvt import (GasZ, PVT, condensate_props, correlation_table, cvd_two_phase_z, gas_equivalent, hall_cf,
                       water_props, wet_gas_gravity)
 from mbal.outliers import residual_screen, runs_test, trend_screen
 from mbal.regress import leave_one_out, pressure_rms, regress
-from mbal.sample import default_config, sample_case
+from mbal.relperm import RelPerm, TankState, fit_water, water_history
+from mbal.sample import default_config, sample_case, sample_wells
+from mbal.wells import Well, fit_ipr, tubing_bhp, well_rate
 
 st.set_page_config(page_title="Condensate Material Balance", page_icon="🛢️", layout="wide")
 ss = st.session_state
@@ -50,6 +53,16 @@ TABLES = {  # name -> [(column, label, quantity or None)]
     "wells": [("well", "Well", "text"), ("date", "Date", "date"), ("gp", "Cum. gas", "gas_cum"),
               ("np", "Cum. condensate", "liq_cum"), ("wp", "Cum. water", "liq_cum")],
     "pres": [("date", "Date", "date"), ("p", "Reservoir pressure", "pressure")] + SURVEY,
+    "wellcfg": [("well", "Well", "text"), ("tvd", "Depth to perforations, TVD", "length"),
+                ("md", "Measured depth (optional)", "length"), ("tid", "Tubing inner diameter", "diam"),
+                ("wht", "Flowing wellhead temperature", "temperature"),
+                ("min_thp", "Minimum tubing-head pressure", "pressure"),
+                ("min_bhp", "Minimum bottomhole pressure", "pressure"),
+                ("qmax", "Maximum gas rate (optional)", "gas_rate")],
+    "tests": [("well", "Well", "text"), ("date", "Date", "date"), ("qg", "Gas rate", "gas_rate"),
+              ("pwf", "Flowing bottomhole pressure", "pressure"),
+              ("pth", "Flowing tubing-head pressure", "pressure"),
+              ("pr", "Reservoir pressure (optional)", "pressure")],
 }
 
 
@@ -71,13 +84,16 @@ def refresh():
     sync_tables()
     ss.ver += 1
     ss.pop("reg", None)
+    ss.pop("rp_fit", None)
 
 
 def load_sample():
     c, tab, hist, wells, pres, start = sample_case()
     c.update(start_date=start, hist_mode="By reservoir")
     ss.vals = c
-    ss.cur = {"pvt": tab, "hist": hist, "wells": wells, "pres": pres, "cvd": empty_table("cvd")}
+    tests, wellcfg = sample_wells(hist, c)
+    ss.cur = {k: empty_table(k) for k in TABLES}
+    ss.cur.update(pvt=tab, hist=hist, wells=wells, pres=pres, tests=tests, wellcfg=wellcfg)
     ss.ver = ss.get("ver", 0)
     refresh()
 
@@ -327,9 +343,10 @@ def fmt_g(scf):
 
 PU, GU = U.label("pressure", SYS), U.label("gas_ip", SYS)
 
-t_pvt, t_prod, t_res, t_hm, t_aq, t_reg = st.tabs(
+t_pvt, t_prod, t_res, t_hm, t_aq, t_reg, t_rp, t_wl, t_fc = st.tabs(
     ["1 · PVT data", "2 · Production history", "3 · Reservoir parameters",
-     "4 · History match", "5 · Aquifer", "6 · Regression"])
+     "4 · History match", "5 · Aquifer", "6 · Regression",
+     "7 · Relative permeability", "8 · Wells", "9 · Forecast"])
 
 # ============================================================ 1. PVT
 with t_pvt:
@@ -472,7 +489,7 @@ with t_pvt:
         V.update(bw=round(bw, 4), cw=float(f"{cw:.3g}"), aq_muw=round(mu, 3))
         refresh()
     st.button("Estimate water properties from correlations", on_click=_est_water,
-              disabled=V["T"] is None or V["pi"] is None,
+              disabled=V["T"] is None or peek("pi", "pressure") is None,
               help="McCain Bw, Osif cw, Beggs-Brill viscosity at initial pressure (tab 3) and "
                    "reservoir temperature; both must be entered first.")
 
@@ -1329,3 +1346,373 @@ with t_reg:
                                              mode="lines", name="Current model", line=dict(color=ORANGE, width=2)))
                     history_points(fig, gas_ip(tank.gpw), U.to_disp("pressure", hist.p, SYS))
                     show(fig, "reg0")
+
+
+# ============================================================ 7. Relative permeability
+RP_TYPICAL = dict(rp_sgrw=0.25, rp_krw=0.3, rp_krg=1.0, rp_nw=3.0, rp_ng=2.0,
+                  rp_soc=0.2, rp_no=3.0, rp_ngo=2.0)
+RP, STATE, RP_MISS = None, None, []
+with t_rp:
+    st.caption("Tank-scale curves used by the forecast. They decide how much water the wells make "
+               "as the aquifer advances, how much gas is trapped behind it, and how far "
+               "retrograde condensate reduces well deliverability. They do not change the "
+               "history match of tabs 4 to 6.")
+    left, right = st.columns([2, 3])
+    with left:
+        st.markdown("**Gas and water**")
+        c = st.columns(3)
+        num("Residual gas saturation to water", "rp_sgrw", "frac", c[0], minv=0.0, maxv=0.6,
+            help="Gas left behind where water has swept. Sets the saturation at which gas stops flowing.")
+        num("Water end point krw", "rp_krw", None, c[1], minv=1e-4, maxv=1.0,
+            help="Water relative permeability at residual gas.")
+        num("Gas end point krg", "rp_krg", None, c[2], minv=0.01, maxv=1.0,
+            help="Gas relative permeability at connate water.")
+        c = st.columns(3)
+        num("Water exponent", "rp_nw", None, c[0], minv=1.0, maxv=8.0)
+        num("Gas exponent", "rp_ng", None, c[1], minv=1.0, maxv=8.0)
+        st.markdown("**Gas and condensate**")
+        c = st.columns(3)
+        num("Critical condensate saturation", "rp_soc", "frac", c[0], minv=0.0, maxv=0.6,
+            help="Condensate in the reservoir flows only above this saturation.")
+        num("Condensate exponent", "rp_no", None, c[1], minv=1.0, maxv=8.0)
+        num("Gas exponent (with condensate)", "rp_ngo", None, c[2], minv=1.0, maxv=8.0)
+        V["rp_vap"] = st.checkbox(
+            "Include water vapour condensing from the gas", value=bool(V.get("rp_vap", True)),
+            key=f"cb_vap_{KEY}",
+            help="Reservoir gas carries water vapour that condenses at surface (Bukacek "
+                 "correlation). It is produced with no aquifer at all, so it is separated from "
+                 "free water before the curves are fitted.")
+
+        def _rp_typical():
+            V.update(RP_TYPICAL)
+            refresh()
+        st.button("Fill typical values", on_click=_rp_typical,
+                  help="Corey values often used when there is no core data. Replace or fit them.")
+        st.caption("Connate water saturation is taken from tab 3.")
+
+    RP_MISS = missing(list(RP_TYPICAL))
+    if not RP_MISS and V["swi"] is not None:
+        if V["swi"] + V["rp_sgrw"] >= 0.95:
+            RP_MISS = ["connate water plus residual gas must leave some movable gas"]
+        else:
+            RP = RelPerm(swc=V["swi"], sgrw=V["rp_sgrw"], krw_max=V["rp_krw"], krg_max=V["rp_krg"],
+                         nw=V["rp_nw"], ng=V["rp_ng"], soc=V["rp_soc"], no=V["rp_no"], ngo=V["rp_ngo"])
+    if READY and V["aq_muw"] is not None:
+        STATE = TankState(tank, V["aq_muw"], ss.cur["cvd"], V["pd"])
+    with left:
+        if RP_MISS:
+            st.info("Still needed: " + ", ".join(RP_MISS).lower() + ".")
+        if not READY:
+            need_data()
+        elif V["aq_muw"] is None:
+            st.info("Enter the water viscosity in tab 1 (Formation water).")
+        elif not np.all(np.isfinite(P_SIM)):
+            st.warning("The model does not reproduce the whole history; fix the match first.")
+        elif RP is not None:
+            def _fit_rp():
+                new, info = fit_water(STATE, RP, P_SIM, WE_SIM, V["rp_vap"])
+                ss.rp_fit = info
+                if info["ok"]:
+                    V.update(rp_krw=float(f"{new.krw_max:.4g}"), rp_nw=float(f"{new.nw:.4g}"))
+                    refresh()
+                    ss.rp_fit = info
+            st.button("Fit water end point and exponent to the water history", on_click=_fit_rp,
+                      type="primary")
+            info = ss.get("rp_fit")
+            if info and info["ok"]:
+                st.success(f"Fitted. Cumulative water is matched to within "
+                           f"{U.to_disp('liq_cum', info['rms'] / 1e3, SYS):,.2f} {U.label('liq_cum', SYS)}."
+                           + (" A value reached its limit, so the history only weakly fixes the "
+                              "curve." if info["at_limit"] else ""))
+            elif info:
+                st.warning(info["reason"])
+            if not STATE.has_condensate:
+                st.caption("No retrograde liquid data (CVD panel in tab 1), so the effect of "
+                           "condensate on gas flow is left out.")
+            elif float(STATE.so(hist.p.min())) > 0:
+                so_now = float(STATE.so(P_SIM[-1]))
+                st.caption(f"Condensate saturation in the tank is now {so_now:.1%} of pore volume: "
+                           + ("above" if so_now > RP.soc else "below")
+                           + " the critical saturation, so reservoir condensate is "
+                           + ("mobile." if so_now > RP.soc else "not mobile and the produced yield "
+                              "follows the CGR column of the PVT table."))
+    with right:
+        if RP is not None:
+            cc = st.columns(2)
+            sw_ = np.linspace(RP.swc, 1.0 - RP.sgrw, 60)
+            krw_, krg_ = RP.gas_water(sw_)
+            f = figure("Water saturation", "Relative permeability", height=280)
+            f.add_trace(go.Scatter(x=sw_, y=krg_, mode="lines", name="Gas", line=dict(color=ORANGE, width=2)))
+            f.add_trace(go.Scatter(x=sw_, y=krw_, mode="lines", name="Water", line=dict(color=BLUE, width=2)))
+            with cc[0]:
+                show(f, "rp_gw")
+            so_ = np.linspace(0.0, 1.0 - RP.swc, 60)
+            f = figure("Condensate saturation", "Relative permeability", height=280)
+            f.add_trace(go.Scatter(x=so_, y=RP.krg_max * RP.cond_mult(so_), mode="lines", name="Gas",
+                                   line=dict(color=ORANGE, width=2)))
+            f.add_trace(go.Scatter(x=so_, y=RP.kro(so_), mode="lines", name="Condensate",
+                                   line=dict(color=AQUA, width=2)))
+            with cc[1]:
+                show(f, "rp_go")
+            if STATE is not None and np.all(np.isfinite(P_SIM)):
+                WH = water_history(STATE, RP, P_SIM, WE_SIM, V["rp_vap"])
+                lu = U.label("liq_cum", SYS)
+                f = figure("", f"Cumulative water ({lu})", height=300)
+                f.add_trace(go.Scatter(x=DATES, y=U.to_disp("liq_cum", hist.wp / 1e3, SYS), mode="markers",
+                                       name="Measured", marker=dict(color=BLUE, size=8)))
+                f.add_trace(go.Scatter(x=DATES, y=U.to_disp("liq_cum", WH["wp"] / 1e3, SYS), mode="lines",
+                                       name="Model total", line=dict(color=ORANGE, width=2)))
+                f.add_trace(go.Scatter(x=DATES, y=U.to_disp("liq_cum", WH["wp_vap"] / 1e3, SYS), mode="lines",
+                                       name="Water vapour only", line=dict(color=GREY, width=2, dash="dash")))
+                show(f, "rp_wp")
+                c = st.columns(3)
+                c[0].metric("Tank water saturation now", f"{WH['sw'][-1]:.1%}",
+                            f"{WH['sw'][-1] - WH['sw'][0]:+.1%} since start", delta_color="off")
+                c[1].metric("Gas flows until water saturation", f"{1 - RP.sgrw:.0%}")
+                c[2].metric(f"Water vapour in gas now ({U.label('cgr', SYS)})",
+                            f"{U.to_disp('cgr', WH['vap'][-1], SYS):.2f}")
+
+# ============================================================ 8. Wells
+WELLS, GZ, WELL_ERR = [], None, None
+
+
+def _f(v):
+    v = pd.to_numeric(v, errors="coerce")
+    return float(v) if pd.notna(v) else np.nan
+
+
+with t_wl:
+    st.caption("Each well needs an inflow relation, fitted here to its tests, and a pressure limit "
+               "to flow against. A test may give the flowing bottomhole pressure directly, or the "
+               "tubing-head pressure, which is converted with the completion data below.")
+    left, right = st.columns([3, 2])
+    with left:
+        st.markdown("**Completion and limits**")
+        cfg_df = table("wellcfg", height=180)
+        st.caption("Depth, tubing size and wellhead temperature are needed only to use tubing-head "
+                   "pressures. Give a minimum tubing-head pressure, a minimum bottomhole pressure, "
+                   "or both.")
+        st.caption("Where a test has no reservoir pressure, it is interpolated in time between the "
+                   "pressure surveys of tab 2.")
+        st.markdown("**Well tests**")
+        tests_df = table("tests", height=300)
+        with st.expander("Import well tests (Excel or CSV)"):
+            st.caption("Columns are found by their headings: well, date, gas rate, flowing bottomhole "
+                       "pressure, tubing-head pressure, reservoir (static) pressure. Values in the "
+                       f"units selected in the sidebar ({U.label('gas_rate', SYS)}, {PU}).")
+            tf = st.file_uploader("Well test file", type=["xlsx", "xlsm", "xls", "csv", "txt"], key="up_tests")
+            if tf is not None and ss.get("tests_id") != tf.file_id:
+                try:
+                    d = read_tests(tf.getvalue(), tf.name)
+                    d["qg"] = U.from_disp("gas_rate", d["qg"], SYS)
+                    for k in ("pwf", "pth", "pr"):
+                        d[k] = U.from_disp("pressure", d[k], SYS)
+                    ss.tests_id = tf.file_id
+                    sync_tables()
+                    names = [str(x) for x in d["well"].unique()]
+                    have = set(ss.cur["wellcfg"]["well"].dropna().astype(str))
+                    add = pd.DataFrame({"well": [n_ for n_ in names if n_ not in have]})
+                    ss.cur["tests"] = d
+                    if len(add):
+                        ss.cur["wellcfg"] = pd.concat([ss.cur["wellcfg"], add], ignore_index=True)
+                    refresh()
+                    st.rerun()
+                except Exception as e:  # noqa: BLE001
+                    st.warning(f"Could not read the file: {e}")
+
+    if not READY:
+        with right:
+            need_data()
+    elif RP is None or STATE is None:
+        with right:
+            st.info("Complete tab 7 (relative permeability) first.")
+    elif not np.all(np.isfinite(P_SIM)):
+        with right:
+            st.warning("The model does not reproduce the whole history; fix the match first.")
+    else:
+        GZ = GasZ(SG_WET, *INERTS)
+        SW_H = STATE.sw(P_SIM, WE_SIM, hist.wp)
+        M_H = STATE.mobility(RP, P_SIM, SW_H)
+        cgr_now = float(pvt.cgr(P_SIM[-1])) if np.nanmax(pvt.cgr_tab) > 0 else V["cgr_i"]
+        CGR_CONST = None if np.nanmax(pvt.cgr_tab) > 0 else V["cgr_i"]
+        tdf = tests_df.dropna(subset=["well", "qg"]).copy()
+        tdf["well"] = tdf["well"].astype(str).str.strip()
+        names = [str(x).strip() for x in cfg_df["well"].dropna() if str(x).strip()]
+        names += [x for x in tdf["well"].unique() if x not in names]
+        rows, PTS = [], {}
+        for nm in names:
+            r = cfg_df[cfg_df["well"].astype(str).str.strip() == nm]
+            r = r.iloc[0] if len(r) else {}
+            w = Well(nm, tvd=_f(r.get("tvd")), md=_f(r.get("md")), tid=_f(r.get("tid")),
+                     wht=_f(r.get("wht")), min_thp=_f(r.get("min_thp")), min_bhp=_f(r.get("min_bhp")),
+                     qmax=_f(r.get("qmax")))
+            qs, xs, skipped = [], [], 0
+            for t_ in tdf[tdf["well"] == nm].itertuples():
+                day = ((pd.Timestamp(t_.date) - pd.Timestamp(V["start_date"])).days
+                       if pd.notna(t_.date) else hist.t[-1])
+                pr_ = (_f(t_.pr) if np.isfinite(_f(t_.pr))
+                       else float(np.interp(day, hist.t[hist.use], hist.p[hist.use])))
+                m_ = float(np.interp(day, hist.t, M_H))
+                wet_ = 1.0 + GE * (float(pvt.cgr(pr_)) if CGR_CONST is None else CGR_CONST) / 1e6
+                if np.isfinite(_f(t_.pwf)):
+                    pwf_ = _f(t_.pwf)
+                elif np.isfinite(_f(t_.pth)) and w.has_tubing:
+                    pwf_ = tubing_bhp(_f(t_.pth), _f(t_.qg), GZ, V["T"], w, wet_)
+                else:
+                    skipped += 1
+                    continue
+                qs.append(_f(t_.qg))
+                xs.append(m_ * (pr_ ** 2 - pwf_ ** 2))
+            w.C, w.n, w.note = fit_ipr(qs, xs)
+            w.n_tests = int(np.sum(np.array(xs) > 0)) if xs else 0
+            if skipped:
+                w.note = (w.note + "; " if w.note else "") + (
+                    f"{skipped} tubing-head test(s) not used: depth, tubing size and wellhead "
+                    "temperature are needed")
+            if np.isfinite(w.C) and w.control is None:
+                w.note = (w.note + "; " if w.note else "") + "no pressure limit set, so it is left out of the forecast"
+            PTS[nm] = (np.array(qs), np.array(xs))
+            WELLS.append(w)
+            wet_now = 1.0 + GE * cgr_now / 1e6
+            q_now, pwf_now = well_rate(w, P_SIM[-1], M_H[-1], GZ, V["T"], wet_now)
+            aof = w.C * (M_H[-1] * P_SIM[-1] ** 2) ** w.n if np.isfinite(w.C) else np.nan
+            rows.append({"Well": nm, "Tests used": w.n_tests,
+                         "C": w.C, "n": w.n,
+                         f"Open-flow potential now ({U.label('gas_rate', SYS)})": U.to_disp("gas_rate", aof, SYS),
+                         f"Rate at limit now ({U.label('gas_rate', SYS)})": U.to_disp("gas_rate", q_now, SYS),
+                         f"Flowing BHP at limit ({PU})": U.to_disp("pressure", pwf_now, SYS),
+                         "Limit": {"thp": "tubing head", "bhp": "bottomhole", None: "none"}[w.control],
+                         "Note": w.note})
+        with right:
+            if not WELLS:
+                st.info("Enter the wells and their tests on the left.")
+            else:
+                f = figure("Mobility × (pr² − pwf²)  (psi²)", f"Gas rate ({U.label('gas_rate', SYS)})", height=380)
+                for i, w in enumerate(WELLS):
+                    col = [BLUE, ORANGE, AQUA, YELLOW, RED, GREY][i % 6]
+                    qs, xs = PTS[w.name]
+                    ok = xs > 0
+                    if ok.any():
+                        f.add_trace(go.Scatter(x=xs[ok], y=U.to_disp("gas_rate", qs[ok], SYS), mode="markers",
+                                               name=f"{w.name} tests", marker=dict(color=col, size=9)))
+                    if np.isfinite(w.C) and ok.any():
+                        xx = np.geomspace(xs[ok].min() * 0.5, max(xs[ok].max(), M_H[-1] * P_SIM[-1] ** 2), 40)
+                        f.add_trace(go.Scatter(x=xx, y=U.to_disp("gas_rate", w.C * xx ** w.n, SYS), mode="lines",
+                                               name=f"{w.name} fit", line=dict(color=col, width=2)))
+                f.update_xaxes(type="log")
+                f.update_yaxes(type="log")
+                show(f, "ipr")
+                st.caption("Deliverability plot. Each line is q = C · [M (pr² − pwf²)]ⁿ fitted to that "
+                           "well's tests; M corrects for the change in gas mobility since initial "
+                           "conditions.")
+        if rows:
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch",
+                         column_config={"C": st.column_config.NumberColumn(format="%.3e"),
+                                        "n": st.column_config.NumberColumn(format="%.2f")})
+            st.caption("Tubing pressure drop uses single-phase gas with the well-stream gravity. "
+                       "Liquid loading is not modelled, so rates close to the end of a well's life "
+                       "are optimistic.")
+
+# ============================================================ 9. Forecast
+with t_fc:
+    c = st.columns(4)
+    num("Forecast length (years)", "fc_years", None, c[0], minv=0.5, maxv=60.0)
+    choice("Time step", "fc_step", {"Monthly": "Monthly", "Quarterly": "Quarterly", "Yearly": "Yearly"}, c[1])
+    num("Field gas rate target (optional)", "fc_qtarget", "gas_rate", c[2], minv=0.0,
+        help="Wells are choked back in proportion when together they can deliver more. "
+             "Empty means every well produces at its own limit.")
+    num("Stop below field gas rate (optional)", "fc_qmin", "gas_rate", c[3], minv=0.0)
+    active = [w for w in WELLS if np.isfinite(w.C) and w.control is not None]
+    if not READY:
+        need_data()
+    elif RP is None or STATE is None:
+        st.info("Complete tab 7 (relative permeability) first.")
+    elif not active:
+        st.info("Complete tab 8 first: at least one well needs usable tests and a pressure limit.")
+    elif V["fc_years"] is None:
+        st.info("Enter the forecast length.")
+    else:
+        try:
+            dt_ = {"Monthly": 30.4375, "Quarterly": 91.3125, "Yearly": 365.25}[V["fc_step"]]
+            FC, FS = forecast(tank, P_SIM, WE_SIM, active, RP, STATE, GZ, V["fc_years"] * 365.25, dt_,
+                              V["fc_qtarget"], V["fc_qmin"], V["rp_vap"], CGR_CONST)
+        except Exception as e:  # noqa: BLE001
+            FC = None
+            st.warning(str(e))
+        if FC is not None:
+            n0 = FS["n_hist"]
+            fdates = pd.Timestamp(V["start_date"]) + pd.to_timedelta(FC["t"], unit="D")
+            fut = FC["forecast"].to_numpy()
+            end_date = fdates[len(FC) - 1].date()
+            gw_end = FC["gp"].iloc[-1] + GE * FC["np"].iloc[-1]
+            c = st.columns(5)
+            c[0].metric(f"Ultimate gas recovery ({GU})", f"{gas_ip(FC['gp'].iloc[-1]):,.1f}",
+                        f"{gas_ip(FC['gp'].iloc[-1] - hist.gp[-1]):,.1f} still to produce", delta_color="off")
+            c[1].metric("Recovery factor (wet gas)", f"{FS['rf_wet']:.1%}",
+                        f"{FS['rf_hist']:.1%} to date", delta_color="off")
+            c[2].metric(f"Ultimate condensate ({U.label('liq_cum', SYS)})",
+                        f"{U.to_disp('liq_cum', FC['np'].iloc[-1] / 1e3, SYS):,.0f}")
+            c[3].metric(f"Ultimate water ({U.label('liq_cum', SYS)})",
+                        f"{U.to_disp('liq_cum', FC['wp'].iloc[-1] / 1e3, SYS):,.0f}")
+            c[4].metric(f"Reservoir pressure at end ({PU})", f"{U.to_disp('pressure', FS['p_end'], SYS):,.0f}")
+            (st.warning if FS["stopped"] else st.info)(
+                f"Forecast ends {end_date}: {FS['reason']}.")
+            if n0 == len(FC):
+                st.warning("No forecast steps could be taken: the wells cannot flow against their "
+                           "limits at the current reservoir pressure. Check tab 8.")
+            if CGR_CONST is not None:
+                st.caption("The PVT table has no producing CGR column, so the initial CGR is held "
+                           "constant. Enter the CGR column in tab 1 to let the yield fall below the dew point.")
+            # history rates from the cumulative record, for continuity on the plots
+            hq = np.diff(hist.gp) / np.diff(hist.t) / 1e6
+            gu, lu_r = U.label("gas_rate", SYS), U.label("liq_rate", SYS)
+            left, right = st.columns(2)
+            f = figure("", f"Gas rate ({gu})", height=320)
+            f.add_trace(go.Scatter(x=DATES[1:], y=U.to_disp("gas_rate", hq, SYS), mode="lines", name="History",
+                                   line=dict(color=GREY, width=2, shape="vh")))
+            f.add_trace(go.Scatter(x=fdates[fut], y=U.to_disp("gas_rate", FC["qg"][fut], SYS), mode="lines",
+                                   name="Field forecast", line=dict(color=BLUE, width=3)))
+            for i, w in enumerate(active):
+                f.add_trace(go.Scatter(x=fdates[fut], y=U.to_disp("gas_rate", FC[f"q_{w.name}"][fut], SYS),
+                                       mode="lines", name=w.name,
+                                       line=dict(color=[ORANGE, AQUA, YELLOW, RED, GREY][i % 5], width=1.5)))
+            with left:
+                show(f, "fc_q")
+            f = figure("", f"Reservoir pressure ({PU})", height=320)
+            f.add_trace(go.Scatter(x=DATES[hist.use], y=U.to_disp("pressure", hist.p[hist.use], SYS),
+                                   mode="markers", name="Measured", marker=dict(color=BLUE, size=8)))
+            f.add_trace(go.Scatter(x=fdates, y=U.to_disp("pressure", FC["p"], SYS), mode="lines",
+                                   name="Model and forecast", line=dict(color=ORANGE, width=2)))
+            with right:
+                show(f, "fc_p")
+            f = figure("", f"Liquid rate ({lu_r})", height=300)
+            f.add_trace(go.Scatter(x=fdates[fut], y=U.to_disp("liq_rate", FC["qc"][fut], SYS), mode="lines",
+                                   name="Condensate", line=dict(color=AQUA, width=2)))
+            f.add_trace(go.Scatter(x=fdates[fut], y=U.to_disp("liq_rate", FC["qw"][fut], SYS), mode="lines",
+                                   name="Water", line=dict(color=BLUE, width=2)))
+            with left:
+                show(f, "fc_l")
+            f = figure("", "Saturation (fraction of pore volume)", height=300)
+            f.add_trace(go.Scatter(x=fdates[fut], y=FC["sw"][fut], mode="lines", name="Water",
+                                   line=dict(color=BLUE, width=2)))
+            f.add_trace(go.Scatter(x=fdates[fut], y=FC["so"][fut], mode="lines", name="Condensate",
+                                   line=dict(color=AQUA, width=2)))
+            with right:
+                show(f, "fc_s")
+            out = pd.DataFrame({
+                "Date": [d.date() for d in fdates[fut]],
+                f"Reservoir pressure ({PU})": np.round(U.to_disp("pressure", FC["p"][fut], SYS), 1),
+                f"Gas rate ({gu})": np.round(U.to_disp("gas_rate", FC["qg"][fut], SYS), 3),
+                f"Condensate rate ({lu_r})": np.round(U.to_disp("liq_rate", FC["qc"][fut], SYS), 1),
+                f"Water rate ({lu_r})": np.round(U.to_disp("liq_rate", FC["qw"][fut], SYS), 1),
+                f"Cum. gas ({U.label('gas_cum', SYS)})": np.round(U.to_disp("gas_cum", FC["gp"][fut] / 1e6, SYS), 1),
+                f"Cum. condensate ({U.label('liq_cum', SYS)})": np.round(U.to_disp("liq_cum", FC["np"][fut] / 1e3, SYS), 1),
+                f"Cum. water ({U.label('liq_cum', SYS)})": np.round(U.to_disp("liq_cum", FC["wp"][fut] / 1e3, SYS), 1),
+                **{f"{w.name} gas rate ({gu})": np.round(U.to_disp("gas_rate", FC[f"q_{w.name}"][fut], SYS), 3)
+                   for w in active},
+                **{f"{w.name} flowing BHP ({PU})": np.round(U.to_disp("pressure", FC[f"pwf_{w.name}"][fut], SYS), 0)
+                   for w in active}})
+            with st.expander("Forecast table"):
+                st.dataframe(out, hide_index=True, width="stretch", height=320)
+                st.download_button("Download forecast (CSV)", out.to_csv(index=False),
+                                   file_name="forecast.csv", mime="text/csv")

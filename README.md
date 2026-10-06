@@ -43,6 +43,13 @@ aquifer detection, and is drawn hollow on the plots. Tab 6 scores the surveys so
 
 The sample case contains two deliberately bad surveys (160 and 180 psi high).
 
+7. **Relative permeability** - tank-scale Corey curves (gas-water, gas-condensate), with a fit of the water
+   curve to the produced-water history after water vapour from the gas has been set aside.
+8. **Wells** - completion data, pressure limits and well tests. Tests may give flowing bottomhole pressure or
+   tubing-head pressure (converted with the tubing calculation). A back-pressure inflow equation is fitted per well.
+9. **Forecast** - the matched tank stepped forward under the well limits and an optional field rate target:
+   gas, condensate and water rates, reservoir pressure, saturations and recovery.
+
 Units switch between Field and SI in the sidebar. Projects save to and load from a JSON file.
 
 ## Method
@@ -66,6 +73,23 @@ G is the wet (well-stream) gas initially in place.
 * Bottom drive is modelled as vertical linear flow through the reservoir area (kv = k * kv/kh).
 * Aquifer detection: quadratic trend test (F-test) on the Cole no-aquifer plot F/Et vs Gp.
 
+### Forecast method
+
+    Sw  = [PVi Swi (1 + cw dp) + We - Wp Bw] / [PVi (1 - cf dp)]        tank water saturation
+    So  = retrograde liquid (CVD) x (1 - Swi)                           tank condensate saturation
+    krw = krw_max Swn^nw,  krg = krg_max (1 - Swn)^ng,  Swn = (Sw - Swc)/(1 - Swc - Sgrw)
+    M   = krg(Sw, So) / (mu z), relative to initial conditions          gas mobility
+    q   = C [M (pr^2 - pwf^2)]^n                                        well inflow
+    pwf^2 = e^s pth^2 + 6.67e-4 q^2 f T^2 z^2 (e^s - 1)(MD/TVD)/d^5     tubing (average T and Z)
+    WGR = (krw / mu_w Bw) / (krg / mu_g Bg)  +  water vapour (Bukacek)
+
+* Rates over a step use the pressure and saturations at the start of the step; the end pressure
+  follows from the material balance, including the aquifer.
+* The curves are tank averages (pseudo curves), not core curves. Trapped gas is represented by gas
+  ceasing to flow as the tank water saturation approaches 1 - Sgrw.
+* Not modelled: liquid loading in the tubing, near-well condensate banking beyond the tank-average
+  saturation, coning, and differences in water arrival between wells.
+
 ## Files
 
     app.py            Streamlit interface
@@ -75,6 +99,9 @@ G is the wet (well-stream) gas initially in place.
     mbal/regress.py   regression (weights, robust loss, leave-one-out)
     mbal/outliers.py  survey screening statistics
     mbal/importer.py  production / pressure workbook import
+    mbal/relperm.py   relative permeability, tank saturations, water fit
+    mbal/wells.py     tubing pressure drop and inflow fit
+    mbal/forecast.py  forecast stepping
     mbal/model.py     configuration -> engine objects
     mbal/sample.py    synthetic sample case
     tests/            engine checks:  python tests/test_engine.py

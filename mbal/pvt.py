@@ -255,3 +255,38 @@ class PVT:
 
     def visc(self, p):
         return gas_viscosity(np.asarray(p, float), self.T, self.z(p), self.sg_wet)
+
+
+# ----------------------------------------------------------------- flowing gas / water vapour
+class GasZ:
+    """Single-phase Z of the flowing well-stream gas at any pressure and temperature
+    (DAK), tabulated per temperature so repeated tubing calculations stay fast."""
+
+    def __init__(self, sg, co2=0.0, h2s=0.0, n2=0.0):
+        self.sg = sg
+        self.tpc, self.ppc = pseudo_criticals(sg, co2, h2s, n2)
+        self._tab = {}
+
+    def __call__(self, p, T):
+        key = round(float(T))
+        if key not in self._tab:
+            pp = np.concatenate([[14.7], np.linspace(100.0, 15000.0, 75)])
+            zz = np.array([z_dak(x / self.ppc, (key + 459.67) / self.tpc) for x in pp])
+            ok = np.isfinite(zz)
+            self._tab[key] = (pp[ok], zz[ok])
+        pp, zz = self._tab[key]
+        return np.interp(p, pp, zz)
+
+    def visc(self, p, T):
+        return gas_viscosity(p, T, self(p, T), self.sg)
+
+
+def water_vapour(p, T):
+    """Water carried as vapour by the reservoir gas, STB/MMscf (Bukacek, 1955).
+    It condenses at surface, so every gas well makes this much water with no aquifer at all."""
+    tc = (np.asarray(T, float) - 32.0) / 1.8
+    a, b, c = np.where(tc < 100.0, (8.07131, 1730.63, 233.426), (8.14019, 1810.94, 244.485)).T \
+        if np.ndim(tc) else ((8.07131, 1730.63, 233.426) if tc < 100.0 else (8.14019, 1810.94, 244.485))
+    psat = 10.0 ** (a - b / (c + tc)) * 14.696 / 760.0          # psia
+    B = 10.0 ** (-3083.87 / (np.asarray(T, float) + 459.6) + 6.69449)
+    return (47484.0 * psat / np.asarray(p, float) + B) / 350.0   # lb/MMscf -> STB/MMscf
