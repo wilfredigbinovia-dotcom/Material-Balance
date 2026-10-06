@@ -344,19 +344,19 @@ def fmt_g(scf):
 PU, GU = U.label("pressure", SYS), U.label("gas_ip", SYS)
 
 t_pvt, t_prod, t_res, t_hm, t_aq, t_reg, t_rp, t_wl, t_fc = st.tabs(
-    ["1 · PVT data", "2 · Production history", "3 · Reservoir parameters",
+    ["1 · PVT", "2 · Production", "3 · Reservoir",
      "4 · History match", "5 · Aquifer", "6 · Regression",
      "7 · Relative permeability", "8 · Wells", "9 · Forecast"])
 
 # ============================================================ 1. PVT
 with t_pvt:
     st.subheader("Fluid description")
-    c = st.columns(4)
+    c = st.columns(4, vertical_alignment="bottom")
     num("Reservoir temperature", "T", "temperature", c[0], step=5.0)
     num("Dew point pressure", "pd", "pressure", c[1], step=50.0, minv=100.0)
     num("Initial condensate-gas ratio", "cgr_i", "cgr", c[2], step=5.0, minv=0.0)
     num("Condensate gravity", "api", "api", c[3], step=1.0, minv=10.0, maxv=90.0)
-    c = st.columns(4)
+    c = st.columns(4, vertical_alignment="bottom")
     num("Separator gas gravity (air = 1)", "sg", None, c[0], step=0.01, minv=0.55, maxv=1.8)
     none_ok = "Leave empty if there is none."
     num("CO₂ (mole fraction)", "co2", None, c[1], step=0.01, minv=0.0, maxv=0.9, help=none_ok)
@@ -477,7 +477,7 @@ with t_pvt:
             st.info(PVT_ERR)
 
     st.subheader("Formation water")
-    c = st.columns(4)
+    c = st.columns(4, vertical_alignment="bottom")
     num("Water formation volume factor", "bw", "fvf_w", c[0], step=0.01, minv=0.9, maxv=1.3)
     num("Water compressibility", "cw", "compress", c[1], step=0.1, minv=0.0)
     num("Water viscosity", "aq_muw", "visc", c[2], step=0.01, minv=0.01)
@@ -619,11 +619,11 @@ with t_prod:
 # ============================================================ 3. Reservoir parameters
 with t_res:
     st.subheader("Initial reservoir parameters")
-    c = st.columns(3)
+    c = st.columns(3, vertical_alignment="bottom")
     num("Initial reservoir pressure", "pi", "pressure", c[0], step=50.0, minv=100.0)
     num("Porosity", "phi", "frac", c[1], step=0.01, minv=0.01, maxv=0.6)
     num("Connate water saturation", "swi", "frac", c[2], step=0.01, minv=0.0, maxv=0.9)
-    c = st.columns(3)
+    c = st.columns(3, vertical_alignment="bottom")
     num("Rock compressibility", "cf", "compress", c[0], step=0.5, minv=0.0)
     num("Original gas in place, initial estimate (wet gas)", "G", "gas_ip", c[1], step=10.0, minv=0.001,
         help="Starting value. The history match and regression refine it.")
@@ -631,7 +631,6 @@ with t_res:
     def _hall():
         V["cf"] = float(f"{hall_cf(V['phi']):.3g}")
         refresh()
-    c[2].write("")
     c[2].button("Estimate rock compressibility (Hall)", on_click=_hall, disabled=V["phi"] is None,
                 help="Needs the porosity.")
     RES_MISS = missing(["pi", "swi", "cf", "G", "bw", "cw"])
@@ -733,7 +732,7 @@ def detection_banner(short=False):
 
 def aquifer_inputs():
     """Aquifer model / geometry / parameter widgets."""
-    c = st.columns(2)
+    c = st.columns(2, vertical_alignment="bottom")
     m = choice("Aquifer model (method)", "aq_model", MODELS, c[0])
     if m in NEEDS_GEOMETRY:
         g = choice("Aquifer system (geometry)", "aq_geom", GEOMETRIES, c[1])
@@ -750,7 +749,7 @@ def aquifer_inputs():
         num("Aquifer constant", "aq_C", "aq_const", step=5.0, minv=0.001,
             help="dWe/dt = C · (pi − p). Constant-pressure outer boundary.")
         return
-    c = st.columns(3)
+    c = st.columns(3, vertical_alignment="bottom")
     if g == "radial":
         num("Reservoir radius", "aq_ro", "length", c[0], step=250.0, minv=10.0)
         inf_ok = m != "fetkovich"
@@ -760,18 +759,18 @@ def aquifer_inputs():
         if not (inf_ok and V["aq_inf"]):
             num("Outer/inner radius ratio (re/ro)", "aq_reD", "ratio", c[1], step=0.5, minv=1.05)
         num("Encroachment angle", "aq_theta", "angle", c[2], step=10.0, minv=1.0, maxv=360.0)
-        c = st.columns(3)
+        c = st.columns(3, vertical_alignment="bottom")
         num("Aquifer thickness", "aq_h", "length", c[0], step=5.0, minv=0.5)
     elif g == "linear":
         num("Aquifer width", "aq_width", "length", c[0], step=250.0, minv=10.0)
         num("Aquifer length", "aq_L", "length", c[1], step=1000.0, minv=10.0)
         num("Aquifer thickness", "aq_h", "length", c[2], step=5.0, minv=0.5)
-        c = st.columns(3)
+        c = st.columns(3, vertical_alignment="bottom")
     else:
         num("Reservoir radius", "aq_ro", "length", c[0], step=250.0, minv=10.0)
         num("Aquifer thickness (below contact)", "aq_h", "length", c[1], step=5.0, minv=0.5)
         num("Vertical anisotropy kv/kh", "aq_kvkh", "ratio", c[2], step=0.05, minv=1e-5, maxv=1.0)
-        c = st.columns(3)
+        c = st.columns(3, vertical_alignment="bottom")
         num("Encroachment angle", "aq_theta", "angle", c[0], step=10.0, minv=1.0, maxv=360.0,
             help="360° when water underlies the whole reservoir.")
     num("Aquifer permeability", "aq_k", "perm", c[1], step=10.0, minv=0.001)
@@ -857,7 +856,7 @@ with t_hm:
 
         # ---------------- graphical
         with s_gr:
-            c = st.columns([2, 3])
+            c = st.columns([2, 3], vertical_alignment="bottom")
             method = c[0].selectbox("Method", METHODS, key=f"gm_{KEY}")
             rng = c[1].slider("History points used for the line fit", 1, n_pts - 1, (1, n_pts - 1),
                               key=f"gr_{KEY}")
@@ -1084,7 +1083,7 @@ with t_reg:
                            "is switched off keeps its production record.")
                 opts = ["Trend of the data (no model)",
                         "Residuals of the latest regression" if reg else "Residuals of the current model"]
-                c = st.columns([3, 2])
+                c = st.columns([3, 2], vertical_alignment="bottom")
                 how = c[0].radio("Compare each survey with", opts, key=f"scr_how_{bool(reg)}_{KEY}")
                 nsig = c[1].number_input("Flag beyond (standard deviations)", 1.5, 6.0, 3.0, 0.5,
                                          key=f"scr_n_{KEY}")
@@ -1220,7 +1219,7 @@ with t_reg:
                                    for c_ in ("Current value", "Minimum", "Maximum")},
                     key=f"reg_{V['aq_model']}_{V['aq_geom']}_{V['aq_inf']}_{KEY}")
                 LOSSES = {"Least squares": "linear", "Robust (soft-L1)": "soft_l1"}
-                c = st.columns([2, 3])
+                c = st.columns([2, 3], vertical_alignment="bottom")
                 loss_lab = c[0].selectbox(
                     "Fitting method", list(LOSSES), key=f"loss_{KEY}",
                     help="Least squares squares every residual, so one bad survey can pull the whole "
@@ -1357,25 +1356,25 @@ with t_rp:
                "as the aquifer advances, how much gas is trapped behind it, and how far "
                "retrograde condensate reduces well deliverability. They do not change the "
                "history match of tabs 4 to 6.")
-    left, right = st.columns([2, 3])
+    left, right = st.columns([1, 1], gap="large")
     with left:
         st.markdown("**Gas and water**")
-        c = st.columns(3)
-        num("Residual gas saturation to water", "rp_sgrw", "frac", c[0], minv=0.0, maxv=0.6,
+        c = st.columns(3, vertical_alignment="bottom")
+        num("Residual gas saturation", "rp_sgrw", "frac", c[0], minv=0.0, maxv=0.6,
             help="Gas left behind where water has swept. Sets the saturation at which gas stops flowing.")
-        num("Water end point krw", "rp_krw", None, c[1], minv=1e-4, maxv=1.0,
+        num("Water end point, krw", "rp_krw", None, c[1], minv=1e-4, maxv=1.0,
             help="Water relative permeability at residual gas.")
-        num("Gas end point krg", "rp_krg", None, c[2], minv=0.01, maxv=1.0,
+        num("Gas end point, krg", "rp_krg", None, c[2], minv=0.01, maxv=1.0,
             help="Gas relative permeability at connate water.")
-        c = st.columns(3)
+        c = st.columns(3, vertical_alignment="bottom")
         num("Water exponent", "rp_nw", None, c[0], minv=1.0, maxv=8.0)
         num("Gas exponent", "rp_ng", None, c[1], minv=1.0, maxv=8.0)
         st.markdown("**Gas and condensate**")
-        c = st.columns(3)
+        c = st.columns(3, vertical_alignment="bottom")
         num("Critical condensate saturation", "rp_soc", "frac", c[0], minv=0.0, maxv=0.6,
             help="Condensate in the reservoir flows only above this saturation.")
         num("Condensate exponent", "rp_no", None, c[1], minv=1.0, maxv=8.0)
-        num("Gas exponent (with condensate)", "rp_ngo", None, c[2], minv=1.0, maxv=8.0)
+        num("Gas exponent", "rp_ngo", None, c[2], minv=1.0, maxv=8.0)
         V["rp_vap"] = st.checkbox(
             "Include water vapour condensing from the gas", value=bool(V.get("rp_vap", True)),
             key=f"cb_vap_{KEY}",
@@ -1390,6 +1389,7 @@ with t_rp:
                   help="Corey values often used when there is no core data. Replace or fit them.")
         st.caption("Connate water saturation is taken from tab 3.")
 
+    LABELS.update(rp_ng="gas exponent (gas and water)", rp_ngo="gas exponent (gas and condensate)")
     RP_MISS = missing(list(RP_TYPICAL))
     if not RP_MISS and V["swi"] is not None:
         if V["swi"] + V["rp_sgrw"] >= 0.95:
@@ -1615,7 +1615,7 @@ with t_wl:
 
 # ============================================================ 9. Forecast
 with t_fc:
-    c = st.columns(4)
+    c = st.columns(4, vertical_alignment="bottom")
     num("Forecast length (years)", "fc_years", None, c[0], minv=0.5, maxv=60.0)
     choice("Time step", "fc_step", {"Monthly": "Monthly", "Quarterly": "Quarterly", "Yearly": "Yearly"}, c[1])
     num("Field gas rate target (optional)", "fc_qtarget", "gas_rate", c[2], minv=0.0,
