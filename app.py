@@ -177,8 +177,8 @@ def choice(label, key, options, where=st, horizontal=None, help=None):
 
 def as_flag(v):
     """Tick-box / CSV value -> bool; blanks count as switched on."""
-    if v is None or (isinstance(v, float) and np.isnan(v)):
-        return True
+    if v is None or v is pd.NA or (isinstance(v, float) and np.isnan(v)):
+        return True     # also what a cleared tick box holds
     if isinstance(v, str):
         return v.strip().lower() not in ("0", "false", "no", "n", "off", "")
     return bool(v)
@@ -198,7 +198,8 @@ def table(name, height=350):
             disp[col] = s.astype("object")
             cfg[col] = st.column_config.TextColumn(lab)
         elif q == "bool":
-            disp[col] = s.map(as_flag).astype(bool)
+            # nullable, so that clearing the cell (Delete key, or pasting a blank) is accepted
+            disp[col] = s.map(as_flag).astype("boolean")
             cfg[col] = st.column_config.CheckboxColumn(
                 lab, default=True, help="Untick to switch this pressure survey off. Its production "
                                         "is kept; its pressure is ignored in every fit.")
@@ -961,7 +962,8 @@ def set_surveys(upd):
     d = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
     for i, dd in d.items():
         if dd in upd:
-            df.at[i, "use"], df.at[i, "w"] = bool(upd[dd][0]), float(upd[dd][1])
+            wt = pd.to_numeric(upd[dd][1], errors="coerce")
+            df.at[i, "use"], df.at[i, "w"] = as_flag(upd[dd][0]), 1.0 if pd.isna(wt) else float(wt)
     ss.cur[name] = df
     refresh()
 
@@ -1007,7 +1009,7 @@ with t_reg:
                     f"Deviation ({PU})": np.round(dev[1:] * pf, 1),
                     "Score": np.round(z[1:], 1),
                     "Flag": np.where(flag[1:], "suspect", ""),
-                    "Use": hist.use[1:], "Weight": hist.w_in[1:]})
+                    "Use": pd.array(hist.use[1:], dtype="boolean"), "Weight": hist.w_in[1:]})
                 ed_s = st.data_editor(
                     tbl, hide_index=True, width="stretch", height=330,
                     disabled=[c_ for c_ in tbl.columns if c_ not in ("Use", "Weight")],
@@ -1117,7 +1119,7 @@ with t_reg:
                 st.caption("Tick the parameters to adjust and set their limits. Regress on as few "
                            "as needed: many aquifer parameters compensate for one another.")
                 ed = st.data_editor(
-                    pd.DataFrame(rows), hide_index=True, width="stretch",
+                    pd.DataFrame(rows).astype({"Regress": "boolean"}), hide_index=True, width="stretch",
                     disabled=["Parameter", "Current value"],
                     column_config={c_: st.column_config.NumberColumn(format="%.5g")
                                    for c_ in ("Current value", "Minimum", "Maximum")},
@@ -1145,7 +1147,7 @@ with t_reg:
                 return sim
 
             if go_btn:
-                pick = [i for i, r in ed.iterrows() if r["Regress"]]
+                pick = [i for i, r in ed.iterrows() if pd.notna(r["Regress"]) and bool(r["Regress"])]
                 if not pick:
                     left.error("Tick at least one parameter.")
                 else:
