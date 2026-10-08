@@ -477,23 +477,6 @@ with t_pvt:
         elif not FLUID_MISS:
             st.info(PVT_ERR)
 
-    st.subheader("Formation water")
-    c = st.columns(4, vertical_alignment="bottom")
-    num("Water formation volume factor", "bw", "fvf_w", c[0], step=0.01, minv=0.9, maxv=1.3)
-    num("Water compressibility", "cw", "compress", c[1], step=0.1, minv=0.0)
-    num("Water viscosity", "aq_muw", "visc", c[2], step=0.01, minv=0.01)
-    num("Water salinity", "salinity", "ppm", c[3], step=5000.0, minv=0.0,
-        help="Only used by the estimate below. Empty counts as fresh water.")
-
-    def _est_water():
-        bw, cw, mu = water_props(V["pi"], V["T"], V["salinity"] or 0.0)
-        V.update(bw=round(bw, 4), cw=float(f"{cw:.3g}"), aq_muw=round(mu, 3))
-        refresh()
-    st.button("Estimate water properties from correlations", on_click=_est_water,
-              disabled=V["T"] is None or peek("pi", "pressure") is None,
-              help="McCain Bw, Osif cw, Beggs-Brill viscosity at initial pressure (tab 3) and "
-                   "reservoir temperature; both must be entered first.")
-
 # ============================================================ 2. Production history
 with t_prod:
     c = st.columns([1, 2, 2])
@@ -634,10 +617,27 @@ with t_res:
         refresh()
     c[2].button("Estimate rock compressibility (Hall)", on_click=_hall, disabled=V["phi"] is None,
                 help="Needs the porosity.")
+
+    st.subheader("Formation water")
+    c = st.columns(4, vertical_alignment="bottom")
+    num("Water formation volume factor", "bw", "fvf_w", c[0], step=0.01, minv=0.9, maxv=1.3)
+    num("Water compressibility", "cw", "compress", c[1], step=0.1, minv=0.0)
+    num("Water viscosity", "aq_muw", "visc", c[2], step=0.01, minv=0.01)
+    num("Water salinity", "salinity", "ppm", c[3], step=5000.0, minv=0.0,
+        help="Only used by the estimate below. Empty counts as fresh water.")
+
+    def _est_water():
+        bw, cw, mu = water_props(V["pi"], V["T"], V["salinity"] or 0.0)
+        V.update(bw=round(bw, 4), cw=float(f"{cw:.3g}"), aq_muw=round(mu, 3))
+        refresh()
+    st.button("Estimate water properties from correlations", on_click=_est_water,
+              disabled=V["T"] is None or V["pi"] is None,
+              help="McCain Bw, Osif cw, Beggs-Brill viscosity at initial pressure (above) and "
+                   "reservoir temperature (tab 1); both must be entered first.")
+
     RES_MISS = missing(["pi", "swi", "cf", "G", "bw", "cw"])
     if RES_MISS:
-        st.info("Still needed: " + ", ".join(RES_MISS).lower()
-                + (" (tab 1, Formation water)." if set(RES_MISS) <= {LABELS["bw"], LABELS["cw"]} else "."))
+        st.info("Still needed: " + ", ".join(RES_MISS).lower() + ".")
     if V["pi"] is not None and V["pd"] is not None and V["pi"] < V["pd"]:
         st.warning("Initial pressure is below the dew point: the reservoir starts two-phase. "
                    "The two-phase Z-factor must then apply from initial conditions.")
@@ -781,7 +781,7 @@ def aquifer_inputs():
     st.caption(f"Aquifer total compressibility = cw + cf = "
                f"{U.to_disp('compress', V['cw'] + V['cf'], SYS):.2f} {U.label('compress', SYS)}; "
                "water viscosity " + ("not entered" if V["aq_muw"] is None else f"{V['aq_muw']:.3g} cp")
-               + " (tab 1)."
+               + " (tab 3)."
                + (" Bottom drive is modelled as vertical linear flow through the reservoir area."
                   if g == "bottom" else ""))
 
@@ -1473,7 +1473,7 @@ with t_rp:
         if not READY:
             need_data()
         elif V["aq_muw"] is None:
-            st.info("Enter the water viscosity in tab 1 (Formation water).")
+            st.info("Enter the water viscosity in tab 3 (Formation water).")
         elif not np.all(np.isfinite(P_SIM)):
             st.warning("The model does not reproduce the whole history; fix the match first.")
         elif RP is not None:
