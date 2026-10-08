@@ -16,7 +16,7 @@ from mbal import units as U
 from mbal.aquifer import GEOMETRIES, MODELS, NEEDS_GEOMETRY, WD
 from mbal.matbal import METHODS, aggregate_wells, build_history, detect_drive, graphical
 from mbal.forecast import forecast
-from mbal.importer import parse_workbook, read_tests, reservoir_tables
+from mbal.importer import DATE_FMT, parse_dates, parse_workbook, read_tests, reservoir_tables
 from mbal.model import PARAMS, aquifer_params, make_aquifer, make_tank
 from mbal.pvt import (GasZ, PVT, condensate_props, correlation_table, cvd_two_phase_z, gas_equivalent, hall_cf,
                       water_props, wet_gas_gravity)
@@ -253,8 +253,11 @@ def table(name, height=350):
     for col, lab, q in spec:
         s = src[col] if col in src else pd.Series(np.nan, index=src.index, dtype="object")
         if q == "date":
-            disp[col] = pd.to_datetime(s, errors="coerce")
-            cfg[col] = st.column_config.DateColumn(lab, format="YYYY-MM-DD")
+            # Shown and typed as text, dd/mm/yyyy, and parsed here day first, so a pasted
+            # 01/11/2019 is always 1 November whatever the browser's locale.
+            dd = parse_dates(s)
+            disp[col] = dd.dt.strftime(DATE_FMT).where(dd.notna(), None).astype("object")
+            cfg[col] = st.column_config.TextColumn(f"{lab} (dd/mm/yyyy)")
         elif q == "text":
             disp[col] = s.astype("object")
             cfg[col] = st.column_config.TextColumn(lab)
@@ -276,8 +279,15 @@ def table(name, height=350):
     ed = st.data_editor(disp, column_config=cfg, num_rows="dynamic", hide_index=True,
                         key=f"t_{name}_{KEY}", height=height, width="stretch")
     out = pd.DataFrame()
-    for col, _, q in spec:
-        if q in ("date", "text"):
+    for col, lab, q in spec:
+        if q == "date":
+            out[col] = parse_dates(ed[col])
+            raw = ed[col].astype("object")
+            bad = raw.notna() & raw.astype(str).str.strip().ne("") & out[col].isna()
+            if bad.any():
+                st.warning(f"{lab}: could not read {', '.join(map(str, raw[bad].head(5)))}"
+                           + (" and others" if bad.sum() > 5 else "") + ". Use dd/mm/yyyy.")
+        elif q == "text":
             out[col] = ed[col]
         elif q == "bool":
             out[col] = ed[col].map(as_flag).astype(bool)
@@ -287,6 +297,30 @@ def table(name, height=350):
             out[col] = U.from_disp(q, pd.to_numeric(ed[col], errors="coerce").astype(float), SYS)
     ss.cur[name] = out.reset_index(drop=True)
     return ss.cur[name]
+
+
+def date_order_check(name):
+    """Warn when a table's dates look like day and month were swapped on pasting
+    (dd/mm read as mm/dd), and offer to swap them back."""
+    d = pd.to_datetime(ss.cur[name]["date"], errors="coerce").dropna()
+    if len(d) < 3:
+        return
+    off_first = (d.dt.day != 1).mean()
+    if d.dt.day.max() <= 12 and off_first >= 0.5:
+        st.warning(f"Every date in this table has a day of 12 or less, and most are not the first of "
+                   f"the month (for example {d.iloc[min(1, len(d) - 1)]:%d/%m/%Y}). Day and month may "
+                   "have been swapped when the dates were pasted. Check them; a swapped survey date "
+                   "puts that pressure against the wrong cumulative production.")
+
+        def _swap():
+            sync_tables()
+            dd = pd.to_datetime(ss.cur[name]["date"], errors="coerce")
+            ok = dd.notna() & (dd.dt.day <= 12)
+            new = dd.copy()
+            new[ok] = pd.to_datetime(dict(year=dd[ok].dt.year, month=dd[ok].dt.day, day=dd[ok].dt.month))
+            ss.cur[name]["date"] = new
+            refresh()
+        st.button("Swap day and month in this table", on_click=_swap, key=f"swap_{name}_{KEY}")
 
 
 def csv_upload(name, note, expander=True):
@@ -311,7 +345,7 @@ def csv_upload(name, note, expander=True):
                     elif i >= raw.shape[1]:
                         df[col] = np.nan
                     elif q == "date":
-                        df[col] = pd.to_datetime(raw.iloc[:, i], errors="coerce")
+                        df[col] = parse_dates(raw.iloc[:, i])
                     elif q == "text":
                         df[col] = raw.iloc[:, i].astype(str)
                     else:
@@ -332,6 +366,12 @@ def figure(xl, yl, height=430, legend=True):
 
 
 def show(fig, key):
+    for tr in fig.data:
+        x = getattr(tr, "x", None)
+        if x is not None and len(x) and isinstance(x[0], (pd.Timestamp, dt.date, np.datetime64, str)) \
+                and pd.notna(pd.to_datetime(str(x[0]), errors="coerce", format="mixed")):
+            fig.update_xaxes(hoverformat="%d/%m/%Y")
+            break
     st.plotly_chart(fig, width="stretch", key=f"fig_{key}_{KEY}", config={"displaylogo": False})
 
 
@@ -483,7 +523,7 @@ with t_pvt:
 # ============================================================ 2. Production history
 with t_prod:
     c = st.columns([1, 2, 2])
-    V["start_date"] = c[0].date_input("Start of production", value=V["start_date"],
+    V["start_date"] = c[0].date_input("Start of production", value=V["start_date"], format="DD/MM/YYYY",
                                       key=f"d_start_{KEY}",
                                       help="The reservoir is at initial pressure with zero "
                                            "cumulative production on this date.")
@@ -514,13 +554,13 @@ with t_prod:
                          f"Start of production will be set to {WB['start_date']}.")
                 if len(WB["pre_start"]):
                     st.info("Surveys before production started (use as initial pressure in tab 3): "
-                            + "; ".join(f"{U.to_disp('pressure', r.p, SYS):,.6g} {PU} on {r.date:%Y-%m-%d}"
+                            + "; ".join(f"{U.to_disp('pressure', r.p, SYS):,.6g} {PU} on {r.date:%d/%m/%Y}"
                                         for r in WB["pre_start"].itertuples()))
                 wide = WB["spread"][WB["spread"]["n"] > 1].sort_values("range", ascending=False)
                 if len(wide) and wide["range"].iloc[0] > 50.0:
                     r = wide.iloc[0]
                     st.warning(f"Wells disagree by {U.to_disp('pressure', r['range'], SYS):,.0f} {PU} on "
-                               f"{r['date']:%Y-%m-%d}. The average is used; correct it in the survey "
+                               f"{r['date']:%d/%m/%Y}. The average is used; correct it in the survey "
                                "table if one of the wells is not representative.")
                 for m in WB["notes"]:
                     st.warning(m)
@@ -542,16 +582,18 @@ with t_prod:
         left, right = st.columns([3, 3])
         with left:
             hist_df = table("hist", height=460)
-            csv_upload("hist", "Dates as YYYY-MM-DD. Use and Weight are optional.")
+            date_order_check("hist")
+            csv_upload("hist", "Dates as dd/mm/yyyy. Use and Weight are optional.")
     else:
         left, right = st.columns([3, 3])
         with left:
             st.markdown("**Well cumulative production**")
             wells_df = table("wells", height=300)
-            csv_upload("wells", "Dates as YYYY-MM-DD.")
+            csv_upload("wells", "Dates as dd/mm/yyyy.")
             st.markdown("**Average reservoir pressure surveys**")
             pres_df = table("pres", height=240)
-            csv_upload("pres", "Dates as YYYY-MM-DD. Use and Weight are optional.")
+            date_order_check("pres")
+            csv_upload("pres", "Dates as dd/mm/yyyy. Use and Weight are optional.")
         try:
             hist_df = aggregate_wells(wells_df, pres_df)
         except Exception as e:  # noqa: BLE001
@@ -684,7 +726,7 @@ if READY:
     DET = detect_drive(tank0)
     n_pts = len(hist.p)
     DATES = pd.Timestamp(V["start_date"]) + pd.to_timedelta(hist.t, unit="D")
-    LAB = np.array([str(d.date()) for d in DATES])
+    LAB = np.array([f"{d:%d/%m/%Y}" for d in DATES])
     N_ON = int(hist.use[1:].sum())
 
 
@@ -836,14 +878,34 @@ with t_aq:
                     num("Transmissibility", "nb_T", "transmiss", minv=0.0,
                         help="Starting value; regress it in tab 6. As a guide, 10 Mscf/d/psi moves "
                              "about 1 Bscf a year across a 300 psi difference.")
+                    choice("In the forecast, the neighbour", "nb_fc",
+                           {"deplete": "depletes as it gives up gas",
+                            "cutoff": "stops exchanging gas",
+                            "constant": "stays at its last pressure (unlimited source)"},
+                           help="'Depletes' treats the neighbour as a closed gas tank: its p/z falls "
+                                "in proportion to the gas it gives up. 'Stays at its last pressure' "
+                                "is an unlimited supply and can recover more gas than both "
+                                "reservoirs hold, so use it only as an upper bound.")
+                    if V["nb_fc"] == "deplete":
+                        num("Neighbour gas in place at its last survey", "nb_G", "gas_ip", minv=0.001,
+                            help="Gas the neighbour still held at the date of its last pressure survey.")
                     st.caption("Enter the neighbour's static pressures at the same datum as this "
-                               "reservoir's. Between surveys the pressure is interpolated; before "
-                               "the first and after the last it is held constant, including "
-                               "through the forecast.")
+                               "reservoir's. Between surveys the pressure is interpolated; after the "
+                               "last survey it is held constant through the rest of the history.")
                 with c[1]:
                     nbr_df = table("nbr", height=215)
-                    csv_upload("nbr", "Dates as YYYY-MM-DD.")
+                    date_order_check("nbr")
+                    csv_upload("nbr", "Dates as dd/mm/yyyy.")
                 d_ = nbr_df.dropna(subset=["date", "p"])
+                if HIST_OK and not d_.empty:
+                    last_ = pd.to_datetime(d_["date"]).max()
+                    end_ = pd.Timestamp(V["start_date"]) + pd.to_timedelta(hist.t[-1], unit="D")
+                    if (end_ - last_).days > 365:
+                        st.warning(f"The neighbour's last survey is {last_:%d/%m/%Y}, "
+                                   f"{(end_ - last_).days / 365.25:.1f} years before the end of the history. "
+                                   f"Its pressure is held at {U.to_disp('pressure', float(d_.sort_values('date')['p'].iloc[-1]), SYS):,.0f} {PU} "
+                                   "from then on, which feeds this reservoir as if the neighbour never "
+                                   "depleted. Add its later surveys.")
                 if V["nb_T"] is None:
                     AQ_MISS = AQ_MISS + ["transmissibility to the neighbouring reservoir"]
                 if d_.empty:
@@ -954,7 +1016,7 @@ with t_hm:
             ok = g["mask"] & np.isfinite(xs) & np.isfinite(ys)
             used, unused = ok & g["sel"], ok & ~g["sel"]
             fig = figure(f"{g['xl']} ({xu})", f"{g['yl']} ({yu})", height=470)
-            lab = [str(d.date()) for d in dates]
+            lab = [f"{d:%d/%m/%Y}" for d in dates]
             fig.add_trace(go.Scatter(x=xs[used], y=ys[used], mode="markers", name="History (in fit)",
                                      text=np.array(lab)[used], marker=dict(color=BLUE, size=9)))
             if unused.any():
@@ -1052,7 +1114,7 @@ with t_hm:
                        "the regression in tab 6 find the match.")
             with st.expander("Results table"):
                 st.dataframe(pd.DataFrame({
-                    "Date": [d.date() for d in dates],
+                    "Date": [f"{d:%d/%m/%Y}" for d in dates],
                     f"Wet gas produced ({GU})": np.round(gas_ip(tank.gpw), 3),
                     f"History pressure ({PU})": np.round(U.to_disp("pressure", hist.p, SYS), 1),
                     f"Model pressure ({PU})": np.round(U.to_disp("pressure", P_SIM, SYS), 1),
@@ -1165,7 +1227,7 @@ with t_reg:
                 flag[0] = False
                 new = flag & hist.use
                 tbl = pd.DataFrame({
-                    "Date": [d.date() for d in DATES[1:]],
+                    "Date": [f"{d:%d/%m/%Y}" for d in DATES[1:]],
                     f"Pressure ({PU})": np.round(U.to_disp("pressure", hist.p[1:], SYS), 1),
                     f"Deviation ({PU})": np.round(dev[1:] * pf, 1),
                     "Score": np.round(z[1:], 1),
@@ -1177,7 +1239,7 @@ with t_reg:
                     column_config={"Weight": st.column_config.NumberColumn(min_value=0.0, format="%.3g",
                                                                            width="small"),
                                    "Use": st.column_config.CheckboxColumn(width="small"),
-                                   "Date": st.column_config.DateColumn(width="small"),
+                                   "Date": st.column_config.TextColumn(width="small"),
                                    tbl.columns[1]: st.column_config.NumberColumn("Pressure", width="small"),
                                    tbl.columns[2]: st.column_config.NumberColumn("Deviation", width="small"),
                                    "Flag": st.column_config.TextColumn(width="small"),
@@ -1811,12 +1873,16 @@ with t_fc:
         st.info("Complete tab 8 first: at least one well needs usable tests and a pressure limit.")
     elif V["fc_years"] is None:
         st.info("Enter the forecast length.")
+    elif tank.has_neighbour and V.get("nb_fc", "deplete") == "deplete" and V.get("nb_G") is None:
+        st.info("Enter the neighbouring reservoir's gas in place in tab 5, or choose how it behaves "
+                "in the forecast.")
     else:
         try:
             dt_ = {"Monthly": 30.4375, "Quarterly": 91.3125, "Yearly": 365.25}[V["fc_step"]]
             FC, FS = forecast(tank, P_SIM, WE_SIM, active, RP, STATE, GZ, V["fc_years"] * 365.25, dt_,
                               V["fc_qtarget"], V["fc_qmin"], V["rp_vap"], CGR_CONST,
-                              bool(V.get("fc_stop_load", True)))
+                              bool(V.get("fc_stop_load", True)), V.get("nb_fc", "deplete"),
+                              (V.get("nb_G") or 0.0) * 1e9)
         except Exception as e:  # noqa: BLE001
             FC = None
             st.warning(str(e))
@@ -1824,13 +1890,21 @@ with t_fc:
             n0 = FS["n_hist"]
             fdates = pd.Timestamp(V["start_date"]) + pd.to_timedelta(FC["t"], unit="D")
             fut = FC["forecast"].to_numpy()
-            end_date = fdates[len(FC) - 1].date()
+            end_date = f"{fdates[len(FC) - 1]:%d/%m/%Y}"
             gw_end = FC["gp"].iloc[-1] + GE * FC["np"].iloc[-1]
             c = st.columns(5)
             c[0].metric(f"Ultimate gas recovery ({GU})", f"{gas_ip(FC['gp'].iloc[-1]):,.1f}",
-                        f"{gas_ip(FC['gp'].iloc[-1] - hist.gp[-1]):,.1f} still to produce", delta_color="off")
-            c[1].metric("Recovery factor (wet gas)", f"{FS['rf_wet']:.1%}",
-                        f"{FS['rf_hist']:.1%} to date", delta_color="off")
+                        f"{gas_ip(FC['gp'].iloc[-1] - hist.gp[-1]):,.1f} still to produce", delta_color="off",
+                        help="Separator gas, history plus forecast. Gas in place and the recovery "
+                             "factor are on a wet-gas basis (condensate converted to gas).")
+            if tank.has_neighbour:
+                c[1].metric("Recovery factor (wet gas)", f"{FS['rf_total']:.1%}",
+                            f"{gas_ip(FS['gx_end']):+,.1f} {GU} net from neighbour", delta_color="off",
+                            help="Wet gas produced divided by this reservoir's gas in place plus the "
+                                 "net gas received from the neighbour.")
+            else:
+                c[1].metric("Recovery factor (wet gas)", f"{FS['rf_wet']:.1%}",
+                            f"{FS['rf_hist']:.1%} to date", delta_color="off")
             c[2].metric(f"Ultimate condensate ({U.label('liq_cum', SYS)})",
                         f"{U.to_disp('liq_cum', FC['np'].iloc[-1] / 1e3, SYS):,.0f}")
             c[3].metric(f"Ultimate water ({U.label('liq_cum', SYS)})",
@@ -1842,7 +1916,7 @@ with t_fc:
             for w in active:
                 lcol = FC[f"load_{w.name}"].to_numpy(bool) & fut
                 if lcol.any():
-                    ld_msgs.append(f"{w.name} from {fdates[np.argmax(lcol)].date()}")
+                    ld_msgs.append(f"{w.name} from {fdates[np.argmax(lcol)]:%d/%m/%Y}")
             if ld_msgs:
                 st.caption("Below the Turner critical rate (liquid loading): " + "; ".join(ld_msgs)
                            + (". Those wells are shut in at that point." if V.get("fc_stop_load", True) else "."))
@@ -1872,6 +1946,9 @@ with t_fc:
                                    mode="markers", name="Measured", marker=dict(color=BLUE, size=8)))
             f.add_trace(go.Scatter(x=fdates, y=U.to_disp("pressure", FC["p"], SYS), mode="lines",
                                    name="Model and forecast", line=dict(color=ORANGE, width=2)))
+            if tank.has_neighbour:
+                f.add_trace(go.Scatter(x=fdates, y=U.to_disp("pressure", FC["pn"], SYS), mode="lines",
+                                       name="Neighbour", line=dict(color=GREY, width=2, dash="dash")))
             with right:
                 show(f, "fc_p")
             f = figure("", f"Liquid rate ({lu_r})", height=300)
@@ -1889,7 +1966,7 @@ with t_fc:
             with right:
                 show(f, "fc_s")
             out = pd.DataFrame({
-                "Date": [d.date() for d in fdates[fut]],
+                "Date": [f"{d:%d/%m/%Y}" for d in fdates[fut]],
                 f"Reservoir pressure ({PU})": np.round(U.to_disp("pressure", FC["p"][fut], SYS), 1),
                 f"Gas rate ({gu})": np.round(U.to_disp("gas_rate", FC["qg"][fut], SYS), 3),
                 f"Condensate rate ({lu_r})": np.round(U.to_disp("liq_rate", FC["qc"][fut], SYS), 1),

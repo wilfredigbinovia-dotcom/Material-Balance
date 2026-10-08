@@ -299,9 +299,26 @@ def test_neighbouring_reservoir():
     # the forecast carries the exchange on, with the neighbour held at its last pressure
     from mbal.wells import Well
     w = Well("x", C=2e-5, n=0.8, min_bhp=500.0)
-    df, s = forecast(hi, p_hi, hi.simulate()[1], [w], rp, state, gz, 5 * 365.25)
+    df, s = forecast(hi, p_hi, hi.simulate()[1], [w], rp, state, gz, 5 * 365.25, nb_mode="constant")
     df0, s0 = forecast(tank0, p0, we0, [w], rp, state, gz, 5 * 365.25)
     assert df.gx.iloc[-1] > df.gx.iloc[len(h.t) - 1] and s["gp_end"] > s0["gp_end"]
+    # a neighbour held at constant pressure is an unlimited source; a finite one is not
+    lim = make_tank(dict(base, nb_T=5.0), pvt, h, neighbour=(h.t, np.full(len(h.t), c["pi"])))
+    p_l, we_l = lim.simulate()
+    w2 = Well("y", C=2e-5, n=0.8, min_bhp=300.0)
+    long = 60 * 365.25
+    dc, sc = forecast(lim, p_l, we_l, [w2], rp, state, gz, long, nb_mode="constant")
+    small = 20e9
+    dd, sd = forecast(lim, p_l, we_l, [w2], rp, state, gz, long, nb_mode="deplete", nb_G=small)
+    dx, sx = forecast(lim, p_l, we_l, [w2], rp, state, gz, long, nb_mode="cutoff")
+    gpw = lambda d_: d_.gp.iloc[-1] + pvt.ge * d_.np.iloc[-1]      # noqa: E731
+    assert gpw(dc) > lim.G                                          # constant source: more than G
+    assert gpw(dd) < lim.G + max(sd["gx_end"], 0) + 1e6             # never more than G + received
+    assert sd["gx_end"] - lim.gx_sim[-1] < small                    # cannot take more than it holds
+    assert abs(sx["gx_end"] - lim.gx_sim[-1]) < 1.0                 # cut off: nothing more crosses
+    assert gpw(dx) < gpw(dd) < gpw(dc) and sd["rf_total"] < 1.0
+    f = dd[dd.forecast]
+    assert np.all(np.diff(f.pn.to_numpy()) <= 1e-6)                 # the neighbour depletes
 
 
 def _tpd_text(fun, q, thp, wgr, gor, psig=True):

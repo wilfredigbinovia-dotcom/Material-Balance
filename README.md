@@ -75,7 +75,9 @@ G is the wet (well-stream) gas initially in place.
 * Neighbouring reservoir (tab 5): for a tank that leaks to or from another sand, gas crosses at
   q = T (p_neighbour - p), with the neighbour's measured static pressures interpolated in time. The
   balance becomes G (Eg + Efw) + We = (Gp,wet - Gx) Bg + Wp Bw, Gx being the cumulative gas received.
-  T can be regressed in tab 6. In the forecast the neighbour is held at its last surveyed pressure.
+  T can be regressed in tab 6. In the forecast the neighbour either depletes as a closed gas tank
+  (its gas in place at the last survey is entered; p/z falls with the gas it gives up), stops
+  exchanging, or stays at its last pressure. The last is an unlimited source and only an upper bound.
 * Aquifer detection: quadratic trend test (F-test) on the Cole no-aquifer plot F/Et vs Gp.
 
 ### Forecast method

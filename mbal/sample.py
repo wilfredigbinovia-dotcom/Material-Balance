@@ -27,7 +27,7 @@ def default_config():
              aq_Wvol=500.0, aq_C=50.0,
              rp_sgrw=0.25, rp_krw=0.3, rp_krg=1.0, rp_nw=3.0, rp_ng=2.0,
              rp_soc=0.2, rp_no=3.0, rp_ngo=2.0, rp_vap=True,
-             nb_on=False, nb_T=5.0,
+             nb_on=False, nb_T=5.0, nb_fc="deplete", nb_G=100.0,
              lift={}, lift_gauge="psig", fc_stop_load=True,
              fc_years=15.0, fc_step="Monthly", fc_qtarget=45.0, fc_qmin=3.0)
     return c

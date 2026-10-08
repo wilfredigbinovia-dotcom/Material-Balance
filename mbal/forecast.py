@@ -8,7 +8,8 @@ from .wells import well_rate
 
 
 def forecast(tank, p_sim, we_sim, wells, rp, state, gz, days, dt=30.4375, q_target=None,
-             q_min=None, vapour=True, cgr_const=None, stop_loading=False):
+             q_min=None, vapour=True, cgr_const=None, stop_loading=False, nb_mode="deplete",
+             nb_G=None):
     """Step the tank from the end of history.
 
     tank          matched Tank (with its aquifer)          p_sim, we_sim  model history
@@ -17,6 +18,12 @@ def forecast(tank, p_sim, we_sim, wells, rp, state, gz, days, dt=30.4375, q_targ
     days          length of the forecast                   dt             step, days
     q_target      field separator-gas target, MMscf/d      q_min          stop below this rate                   stop_loading   shut in wells that load up
     cgr_const     producing CGR to use when the PVT table has no CGR column, STB/MMscf
+    nb_mode       neighbouring reservoir during the forecast:
+                  'deplete'  - a closed gas tank of nb_G scf (at its last survey) whose p/z falls
+                               as it gives up gas (and rises as it receives it)
+                  'constant' - held at its last surveyed pressure: an unlimited source, so an
+                               upper bound only
+                  'cutoff'   - no exchange after the end of history
 
     Rates over a step are evaluated at the pressure and saturations at the start of the step;
     the pressure at the end of the step then follows from the material balance.
@@ -34,7 +41,22 @@ def forecast(tank, p_sim, we_sim, wells, rp, state, gz, days, dt=30.4375, q_targ
     p, We, gx = np.full(N, np.nan), np.zeros(N), np.zeros(N)
     p[:n0], We[:n0] = p_sim, we_sim
     gx[:n0] = tank.gx_sim
-    pn = tank.neighbour_p(t)          # held at its last survey through the forecast
+    pn = tank.neighbour_p(t)          # held at its last survey ('constant')
+    nb_on = tank.has_neighbour and nb_mode != "cutoff"
+    if tank.has_neighbour and nb_mode == "deplete":
+        if not nb_G or nb_G <= 0:
+            raise ValueError("Enter the neighbouring reservoir's gas in place, or choose how the "
+                             "neighbour behaves in the forecast.")
+        t_last = float(tank.nb_t[-1])
+        gx_last = float(np.interp(t_last, h.t, tank.gx_sim)) if t_last > h.t[0] else 0.0
+        pz_grid = np.linspace(max(pv.p_range[0], 14.7), pv.p_range[1], 400)
+        pz_vals = pz_grid / pv.z(pz_grid)
+        o_ = np.argsort(pz_vals)
+        pz_last = float(tank.nb_p[-1] / pv.z(tank.nb_p[-1]))
+
+        def nb_pressure(gx_now):
+            frac = 1.0 - (gx_now - gx_last) / nb_G          # neighbour gas left, fraction
+            return float(np.interp(max(frac, 0.0) * pz_last, pz_vals[o_], pz_grid[o_]))
     gp, npc, wp = (np.concatenate([a, np.zeros(nf)]) for a in (h.gp, h.np_, h.wp))
     gpw = gp + pv.ge * npc
     cols = {k: np.full(N, np.nan) for k in ("qg", "qc", "qw", "sw", "so", "wgr", "cgr", "M")}
@@ -71,10 +93,16 @@ def forecast(tank, p_sim, we_sim, wells, rp, state, gz, days, dt=30.4375, q_targ
         gp[i], npc[i], wp[i] = gp[i - 1] + qg * step, npc[i - 1] + qc * step, wp[i - 1] + qw * step
         gpw[i] = gp[i] + pv.ge * npc[i]
 
+        if tank.has_neighbour and nb_mode == "deplete":
+            pn[i] = nb_pressure(gx[i - 1])
+
+        def gx_at(pp_arr):
+            return tank.gx_step(i, pp_arr, gx, t, pn) if nb_on else gx[i - 1]
+
         def bal(pp):
             p[i] = pp
             return (tank.G * tank.Et(pp) + aq.we_at(i, p, We)
-                    - (gpw[i] - tank.gx_step(i, p, gx, t, pn)) * pv.bg(pp) - wp[i] * tank.bw)
+                    - (gpw[i] - gx_at(p)) * pv.bg(pp) - wp[i] * tank.bw)
 
         r_hi, r_lo = bal(tank.pi), bal(plo)
         if not (np.isfinite(r_hi) and np.isfinite(r_lo)) or r_lo < 0:
@@ -83,7 +111,7 @@ def forecast(tank, p_sim, we_sim, wells, rp, state, gz, days, dt=30.4375, q_targ
             break
         p[i] = tank.pi if r_hi >= 0 else brentq(bal, plo, tank.pi, xtol=1e-3)
         We[i] = aq.we_at(i, p, We)
-        gx[i] = tank.gx_step(i, p, gx, t, pn)
+        gx[i] = gx_at(p)
         for k, v in (("qg", tot), ("qc", qc), ("qw", qw), ("sw", sw), ("so", float(state.so(pr))),
                      ("wgr", wgr), ("cgr", cgr), ("M", M)):
             cols[k][i] = v
@@ -94,13 +122,14 @@ def forecast(tank, p_sim, we_sim, wells, rp, state, gz, days, dt=30.4375, q_targ
                 max(pr * pr - (qq / w.C) ** (1.0 / w.n) / M, 0.0)) if qq > 0 else np.nan
     sl = slice(0, last + 1)
     df = pd.DataFrame({"t": t[sl], "p": p[sl], "gp": gp[sl], "np": npc[sl], "wp": wp[sl],
-                       "we": We[sl], "gx": gx[sl], **{k: v[sl] for k, v in cols.items()},
+                       "we": We[sl], "gx": gx[sl], "pn": pn[sl] if tank.has_neighbour else np.nan, **{k: v[sl] for k, v in cols.items()},
                        **{f"q_{k}": v[sl] for k, v in qwell.items()},
                        **{f"pwf_{k}": v[sl] for k, v in pwfw.items()},
                        **{f"load_{k}": v[sl] for k, v in loadw.items()}})
     df["forecast"] = np.arange(len(df)) >= n0
     summary = dict(reason=reason, n_hist=n0, t_end=float(t[last]), p_end=float(p[last]),
                    gp_end=float(gp[last]), np_end=float(npc[last]), wp_end=float(wp[last]),
-                   gx_end=float(gx[last]), rf_wet=float(gpw[last] / tank.G), rf_hist=float(gpw[n0 - 1] / tank.G),
+                   gx_end=float(gx[last]), rf_wet=float(gpw[last] / tank.G),
+                   rf_total=float(gpw[last] / (tank.G + max(float(gx[last]), 0.0))), rf_hist=float(gpw[n0 - 1] / tank.G),
                    stopped=last < N - 1)
     return df, summary

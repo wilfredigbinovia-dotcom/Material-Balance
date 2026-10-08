@@ -1,7 +1,33 @@
 """Read a production / pressure workbook (Excel or CSV) by its column headings."""
 import io
+import re
 import numpy as np
 import pandas as pd
+
+DATE_FMT = "%d/%m/%Y"     # how dates are shown and typed throughout the app
+
+
+def parse_dates(s):
+    """Dates typed, pasted or imported -> datetime64. Text is read day first (dd/mm/yyyy, also
+    dd-mm-yyyy, dd.mm.yyyy, 1 Nov 2019); ISO text (yyyy-mm-dd) and real dates from Excel are
+    taken as they are. Anything unreadable becomes NaT."""
+    s = pd.Series(s)
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return pd.to_datetime(s).dt.tz_localize(None) if getattr(s.dt, "tz", None) else s
+    out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+    for i, v in s.items():
+        if v is None or (isinstance(v, float) and np.isnan(v)) or (isinstance(v, str) and not v.strip()):
+            continue
+        if isinstance(v, (pd.Timestamp, np.datetime64)) or hasattr(v, "year"):
+            out[i] = pd.Timestamp(v).tz_localize(None) if pd.Timestamp(v).tzinfo else pd.Timestamp(v)
+            continue
+        txt = str(v).strip()
+        iso = re.match(r"^\d{4}-\d{1,2}-\d{1,2}", txt)
+        try:
+            out[i] = pd.to_datetime(txt[:10] if iso else txt, dayfirst=not iso)
+        except (ValueError, TypeError, OverflowError):
+            pass
+    return out
 
 # column -> words looked for in the heading (first match wins, checked in this order)
 KEYS = [("reservoir", ("reservoir", "tank", "sand")), ("well", ("well", "string", "completion")),
@@ -45,7 +71,7 @@ def parse_workbook(raw, filename):
     for d in read_sheets(raw, filename):
         if "date" not in d:
             continue
-        d["date"] = pd.to_datetime(d["date"], errors="coerce")
+        d["date"] = parse_dates(d["date"])
         d = d.dropna(subset=["date"])
         for k, default in (("reservoir", "Reservoir"), ("well", "Reservoir")):
             d[k] = d[k].astype(str).str.strip() if k in d else default
@@ -103,7 +129,7 @@ def reservoir_tables(prod, pres, reservoir):
     late = avg[avg["date"] > w["date"].max()]
     if len(late):
         notes.append(f"{len(late)} survey(s) are dated after the last production record "
-                     f"({w['date'].max():%Y-%m-%d}); cumulative production is held constant "
+                     f"({w['date'].max():%d/%m/%Y}); cumulative production is held constant "
                      "to those dates.")
     surveys = avg[avg["date"] > start].copy()
     surveys["use"], surveys["w"] = True, 1.0
@@ -139,7 +165,7 @@ def read_tests(raw, filename):
             continue
         d = pd.DataFrame({k: df[v] for k, v in cols.items()})
         d["well"] = d["well"].astype(str).str.strip() if "well" in d else "Well"
-        d["date"] = pd.to_datetime(d["date"], errors="coerce") if "date" in d else pd.NaT
+        d["date"] = parse_dates(d["date"]) if "date" in d else pd.NaT
         for k in ("qg", "pwf", "pth", "pr", "wgr"):
             d[k] = pd.to_numeric(d[k], errors="coerce") if k in d else np.nan
         out.append(d.dropna(subset=["qg"])[["well", "date", "qg", "pwf", "pth", "pr", "wgr"]])
