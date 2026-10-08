@@ -31,8 +31,10 @@ def forecast(tank, p_sim, we_sim, wells, rp, state, gz, days, dt=30.4375, q_targ
     t = np.concatenate([h.t, h.t[-1] + dt * np.arange(1, nf + 1)])
     N = len(t)
     aq = replace(tank.aq).prepare(t)
-    p, We = np.full(N, np.nan), np.zeros(N)
+    p, We, gx = np.full(N, np.nan), np.zeros(N), np.zeros(N)
     p[:n0], We[:n0] = p_sim, we_sim
+    gx[:n0] = tank.gx_sim
+    pn = tank.neighbour_p(t)          # held at its last survey through the forecast
     gp, npc, wp = (np.concatenate([a, np.zeros(nf)]) for a in (h.gp, h.np_, h.wp))
     gpw = gp + pv.ge * npc
     cols = {k: np.full(N, np.nan) for k in ("qg", "qc", "qw", "sw", "so", "wgr", "cgr", "M")}
@@ -66,7 +68,8 @@ def forecast(tank, p_sim, we_sim, wells, rp, state, gz, days, dt=30.4375, q_targ
 
         def bal(pp):
             p[i] = pp
-            return tank.G * tank.Et(pp) + aq.we_at(i, p, We) - gpw[i] * pv.bg(pp) - wp[i] * tank.bw
+            return (tank.G * tank.Et(pp) + aq.we_at(i, p, We)
+                    - (gpw[i] - tank.gx_step(i, p, gx, t, pn)) * pv.bg(pp) - wp[i] * tank.bw)
 
         r_hi, r_lo = bal(tank.pi), bal(plo)
         if not (np.isfinite(r_hi) and np.isfinite(r_lo)) or r_lo < 0:
@@ -75,6 +78,7 @@ def forecast(tank, p_sim, we_sim, wells, rp, state, gz, days, dt=30.4375, q_targ
             break
         p[i] = tank.pi if r_hi >= 0 else brentq(bal, plo, tank.pi, xtol=1e-3)
         We[i] = aq.we_at(i, p, We)
+        gx[i] = tank.gx_step(i, p, gx, t, pn)
         for k, v in (("qg", tot), ("qc", qc), ("qw", qw), ("sw", sw), ("so", float(state.so(pr))),
                      ("wgr", wgr), ("cgr", cgr), ("M", M)):
             cols[k][i] = v
@@ -84,12 +88,12 @@ def forecast(tank, p_sim, we_sim, wells, rp, state, gz, days, dt=30.4375, q_targ
                 max(pr * pr - (qq / w.C) ** (1.0 / w.n) / M, 0.0)) if qq > 0 else np.nan
     sl = slice(0, last + 1)
     df = pd.DataFrame({"t": t[sl], "p": p[sl], "gp": gp[sl], "np": npc[sl], "wp": wp[sl],
-                       "we": We[sl], **{k: v[sl] for k, v in cols.items()},
+                       "we": We[sl], "gx": gx[sl], **{k: v[sl] for k, v in cols.items()},
                        **{f"q_{k}": v[sl] for k, v in qwell.items()},
                        **{f"pwf_{k}": v[sl] for k, v in pwfw.items()}})
     df["forecast"] = np.arange(len(df)) >= n0
     summary = dict(reason=reason, n_hist=n0, t_end=float(t[last]), p_end=float(p[last]),
                    gp_end=float(gp[last]), np_end=float(npc[last]), wp_end=float(wp[last]),
-                   rf_wet=float(gpw[last] / tank.G), rf_hist=float(gpw[n0 - 1] / tank.G),
+                   gx_end=float(gx[last]), rf_wet=float(gpw[last] / tank.G), rf_hist=float(gpw[n0 - 1] / tank.G),
                    stopped=last < N - 1)
     return df, summary

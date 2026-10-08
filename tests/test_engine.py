@@ -264,6 +264,46 @@ def test_forecast():
     assert s2["gp_end"] < s["gp_end"]
 
 
+def test_neighbouring_reservoir():
+    from mbal.forecast import forecast
+    c, pvt, h, tank0, p0, we0, rp, state, gz, tests, cfg, hist_df = _sample_forecast_setup(aquifer=False)
+    base = dict(c, G=TRUTH["G"], nb_on=True)
+    # no transmissibility, or a neighbour that is switched off: the closed tank
+    assert np.allclose(make_tank(dict(base, nb_T=0.0), pvt, h, neighbour=(h.t, p0)).simulate()[0], p0)
+    assert np.allclose(make_tank(dict(base, nb_on=False, nb_T=50.0), pvt, h,
+                                 neighbour=(h.t, p0 + 500)).simulate()[0], p0)
+    # a neighbour held at initial pressure feeds gas in and holds pressure up; one at low
+    # pressure takes gas out
+    hi = make_tank(dict(base, nb_T=20.0), pvt, h, neighbour=([0.0], [c["pi"]]))
+    p_hi = hi.simulate()[0]
+    assert np.all(p_hi[1:] > p0[1:]) and hi.gx_sim[-1] > 0
+    lo = make_tank(dict(base, nb_T=0.5), pvt, h, neighbour=([0.0], [300.0]))
+    p_lo = lo.simulate()[0]
+    assert np.all(p_lo[1:] < p0[1:]) and lo.gx_sim[-1] < 0
+    # the gas that crossed is exactly the integral of T * pressure difference
+    dp = c["pi"] - p_hi
+    assert abs(hi.gx_sim[-1] - 20e3 * np.sum(dp[1:] * np.diff(h.t))) < 1e-3 * hi.gx_sim[-1]
+    # and the tank balances with it: G Et = (Gp - Gx) Bg + Wp Bw
+    i = len(h.t) - 1
+    lhs = hi.G * hi.Et(p_hi[i])
+    assert abs(lhs - (hi.gpw[i] - hi.gx_sim[i]) * pvt.bg(p_hi[i]) - h.wp[i] * hi.bw) / lhs < 1e-5
+    # an enormous transmissibility pins the tank to the neighbour
+    pin = make_tank(dict(base, nb_T=1e5), pvt, h, neighbour=([0.0], [c["pi"] - 300.0])).simulate()[0]
+    assert abs(pin[-1] - (c["pi"] - 300.0)) < 15.0
+    # regression recovers G and the transmissibility from a history generated with them
+    nb = (h.t, np.linspace(c["pi"], 3000.0, len(h.t)))
+    true = make_tank(dict(base, nb_T=12.0), pvt, h, neighbour=nb).simulate()[0]
+    sim = lambda x: make_tank(dict(base, G=x[0], nb_T=x[1]), pvt, h, neighbour=nb).simulate()[0]   # noqa: E731
+    r = regress(sim, true, [400.0, 1.0], [50.0, 0.01], [2000.0, 500.0])
+    assert abs(r["x"][0] / TRUTH["G"] - 1) < 0.02 and abs(r["x"][1] / 12.0 - 1) < 0.05
+    # the forecast carries the exchange on, with the neighbour held at its last pressure
+    from mbal.wells import Well
+    w = Well("x", C=2e-5, n=0.8, min_bhp=500.0)
+    df, s = forecast(hi, p_hi, hi.simulate()[1], [w], rp, state, gz, 5 * 365.25)
+    df0, s0 = forecast(tank0, p0, we0, [w], rp, state, gz, 5 * 365.25)
+    assert df.gx.iloc[-1] > df.gx.iloc[len(h.t) - 1] and s["gp_end"] > s0["gp_end"]
+
+
 if __name__ == "__main__":
     for k, v in list(globals().items()):
         if k.startswith("test_"):

@@ -53,6 +53,7 @@ TABLES = {  # name -> [(column, label, quantity or None)]
     "wells": [("well", "Well", "text"), ("date", "Date", "date"), ("gp", "Cum. gas", "gas_cum"),
               ("np", "Cum. condensate", "liq_cum"), ("wp", "Cum. water", "liq_cum")],
     "pres": [("date", "Date", "date"), ("p", "Reservoir pressure", "pressure")] + SURVEY,
+    "nbr": [("date", "Date", "date"), ("p", "Neighbour static pressure", "pressure")],
     "wellcfg": [("well", "Well", "text"), ("tvd", "Depth to perforations, TVD", "length"),
                 ("md", "Measured depth (optional)", "length"), ("tid", "Tubing inner diameter", "diam"),
                 ("wht", "Flowing wellhead temperature", "temperature"),
@@ -668,7 +669,7 @@ with t_res:
 
 # ============================================================ engine
 READY = PVT_OK and HIST_OK and not RES_MISS
-AQ_MISS = []
+AQ_MISS, NB = [], None
 if READY:
     lo, hi = pvt.p_range
     if V["pi"] > hi * 1.0001 or hist.p.min() < lo:
@@ -708,16 +709,18 @@ def need_data():
     elif RES_MISS:
         st.info("Complete the reservoir parameters first: " + ", ".join(RES_MISS).lower() + ".")
     elif AQ_MISS:
-        st.info("Complete the aquifer in tab 5 first: " + ", ".join(AQ_MISS).lower()
-                + ". Or set the aquifer model to none.")
+        st.info("Complete tab 5 first: " + ", ".join(AQ_MISS).lower()
+                + ". Or switch that aquifer or neighbouring reservoir off.")
 
 
 def detection_banner(short=False):
     msg = DET["message"]
     if DET["status"] == "aquifer":
-        if V["aq_model"] == "none":
+        if V["aq_model"] == "none" and V.get("nb_on"):
+            st.success(f"**Additional energy source detected**; a neighbouring reservoir is modelled. {msg}")
+        elif V["aq_model"] == "none":
             st.warning(f"**Additional energy source detected.** {msg}"
-                       + (" Go to tab 5 to define the aquifer." if short else ""))
+                       + (" Go to tab 5 to define the aquifer or a neighbouring reservoir." if short else ""))
         else:
             st.success(f"**Additional energy source detected and modelled** with "
                        f"{MODELS[V['aq_model']]}. {msg}")
@@ -815,9 +818,42 @@ with t_aq:
             if AQ_MISS:
                 st.info("Still needed for this aquifer: " + ", ".join(AQ_MISS).lower() + ".")
 
+            st.subheader("Neighbouring reservoir")
+            V["nb_on"] = st.checkbox(
+                "This reservoir exchanges gas with a neighbouring reservoir", value=bool(V.get("nb_on")),
+                key=f"cb_nb_{KEY}",
+                help="For a reservoir that leaks to or from another sand, across a non-sealing "
+                     "fault or through a wellbore. Gas crosses in proportion to the pressure "
+                     "difference: rate = transmissibility × (neighbour pressure − this reservoir's "
+                     "pressure). It flows in when the neighbour is at higher pressure and out "
+                     "when it is lower.")
+            if V["nb_on"]:
+                c = st.columns([2, 3], vertical_alignment="top")
+                with c[0]:
+                    num("Transmissibility", "nb_T", "transmiss", minv=0.0,
+                        help="Starting value; regress it in tab 6. As a guide, 10 Mscf/d/psi moves "
+                             "about 1 Bscf a year across a 300 psi difference.")
+                    st.caption("Enter the neighbour's static pressures at the same datum as this "
+                               "reservoir's. Between surveys the pressure is interpolated; before "
+                               "the first and after the last it is held constant, including "
+                               "through the forecast.")
+                with c[1]:
+                    nbr_df = table("nbr", height=215)
+                    csv_upload("nbr", "Dates as YYYY-MM-DD.")
+                d_ = nbr_df.dropna(subset=["date", "p"])
+                if V["nb_T"] is None:
+                    AQ_MISS = AQ_MISS + ["transmissibility to the neighbouring reservoir"]
+                if d_.empty:
+                    AQ_MISS = AQ_MISS + ["at least one neighbour pressure"]
+                else:
+                    NB = ((pd.to_datetime(d_["date"]) - pd.Timestamp(V["start_date"])).dt.days.to_numpy(float),
+                          d_["p"].to_numpy(float))
+                if V["nb_T"] is None or d_.empty:
+                    st.info("Still needed: " + ", ".join(AQ_MISS[-(int(V["nb_T"] is None) + int(d_.empty)):]) + ".")
+
 READY = READY and not AQ_MISS
 if READY:
-    tank = make_tank(cfg(), pvt, hist)
+    tank = make_tank(cfg(), pvt, hist, neighbour=NB)
     P_SIM, WE_SIM = tank.simulate()
     WE_HIST = tank.We_history()
     RMS = pressure_rms(P_SIM, hist.p, hist.w)
@@ -841,6 +877,33 @@ with t_aq:
                          "n/a" if not np.isfinite(RMS) else f"{U.to_disp('pressure', RMS, SYS):,.1f}")
             c2[1].metric("Influx / withdrawal at end", f"{WE_HIST[-1] / tank.F()[-1]:.0%}")
             st.caption("See tab 4 for the plots with this aquifer and tab 6 to regress its parameters.")
+    if READY and tank.has_neighbour:
+        with left:
+            st.subheader("Exchange with the neighbouring reservoir over the history")
+            gx_ = tank.gx_sim
+            dpn = tank.pn - P_SIM
+            c = st.columns(3)
+            c[0].metric(f"Net gas received ({GU})", f"{gas_ip(gx_[-1]):+,.2f}",
+                        help="Positive: gas has come in from the neighbour. Negative: this "
+                             "reservoir has lost gas to it.")
+            c[1].metric(f"Pressure difference now ({PU})",
+                        f"{U.to_disp('pressure', dpn[-1], SYS):+,.0f}", help="Neighbour minus this reservoir.")
+            c[2].metric(f"Transfer rate now ({U.label('gas_rate', SYS)})",
+                        f"{U.to_disp('gas_rate', tank.nb_T * dpn[-1] / 1e6, SYS):+,.2f}")
+            f = figure("", f"Pressure ({PU})", height=300)
+            f.add_trace(go.Scatter(x=DATES, y=U.to_disp("pressure", P_SIM, SYS), mode="lines",
+                                   name="This reservoir (model)", line=dict(color=ORANGE, width=2)))
+            f.add_trace(go.Scatter(x=DATES, y=U.to_disp("pressure", tank.pn, SYS), mode="lines",
+                                   name="Neighbour (interpolated)", line=dict(color=GREY, width=2, dash="dash")))
+            nd_ = pd.Timestamp(V["start_date"]) + pd.to_timedelta(NB[0], unit="D")
+            f.add_trace(go.Scatter(x=nd_, y=U.to_disp("pressure", NB[1], SYS), mode="markers",
+                                   name="Neighbour surveys", marker=dict(color=GREY, size=8)))
+            history_points(f, DATES, U.to_disp("pressure", hist.p, SYS))
+            show(f, "nb_p")
+            f = figure("", f"Cumulative gas received ({GU})", height=240, legend=False)
+            f.add_trace(go.Scatter(x=DATES, y=gas_ip(gx_), mode="lines", line=dict(color=BLUE, width=2)))
+            f.add_hline(y=0, line_color=GREY, line_width=1)
+            show(f, "nb_g")
 
 # ============================================================ 4. History match
 with t_hm:
@@ -959,13 +1022,14 @@ with t_hm:
         # ---------------- analytical
         with s_an:
             fig = figure(f"Cumulative wet gas produced ({GU})", f"Reservoir pressure ({PU})", height=470)
-            if AQ.active:
+            if AQ.active or tank.has_neighbour:
                 p_na = tank0.simulate()[0]
                 fig.add_trace(go.Scatter(x=gas_ip(tank.gpw), y=U.to_disp("pressure", p_na, SYS),
-                                         mode="lines", name="Model without aquifer",
+                                         mode="lines", name="Closed tank (no aquifer or neighbour)",
                                          line=dict(color=GREY, width=2, dash="dash")))
             fig.add_trace(go.Scatter(x=gas_ip(tank.gpw), y=U.to_disp("pressure", P_SIM, SYS), mode="lines",
-                                     name="Model" + (f" ({MODELS[AQ.model]})" if AQ.active else " (no aquifer)"),
+                                     name="Model" + (f" ({MODELS[AQ.model]})" if AQ.active else " (no aquifer)")
+                                     + (" with neighbour" if tank.has_neighbour else ""),
                                      line=dict(color=ORANGE, width=2)))
             history_points(fig, gas_ip(tank.gpw), U.to_disp("pressure", hist.p, SYS))
             show(fig, "an")
@@ -999,14 +1063,14 @@ with t_hm:
         with s_en:
             en = tank.energy()
             fig = figure("", "Share of reservoir energy", height=450)
-            for (name, y), col in zip(en.items(), (BLUE, YELLOW, AQUA)):
+            for (name, y), col in zip(en.items(), (BLUE, YELLOW, AQUA, ORANGE)):
                 fig.add_trace(go.Scatter(x=dates[1:], y=y[1:], mode="lines", name=name, stackgroup="e",
                                          line=dict(width=1, color=col),
                                          hovertemplate="%{y:.1%}<extra>" + name + "</extra>"))
             fig.update_yaxes(tickformat=".0%", range=[0, 1])
             fig.update_layout(hovermode="x unified")
             show(fig, "en")
-            c = st.columns(3)
+            c = st.columns(len(en))
             for holder, (name, y) in zip(c, en.items()):
                 holder.metric(f"{name}, latest", f"{y[-1]:.1%}")
             st.caption("Drive indices from measured pressures: G·Eg, G·Efw and We as fractions of "
@@ -1194,8 +1258,10 @@ with t_reg:
             st.subheader("Regress on parameters to match pressure history")
             keys = ["G", "cf"] + aquifer_params(V["aq_model"], V["aq_geom"],
                                                 bool(V["aq_inf"]) and V["aq_model"] != "fetkovich")
+            if tank.has_neighbour:
+                keys.append("nb_T")
             default_on = {"G"} | set({"pot": ["aq_Wvol"], "schilthuis": ["aq_C"]}.get(
-                V["aq_model"], [k for k in keys if k in ("aq_reD", "aq_k", "aq_L")]))
+                V["aq_model"], [k for k in keys if k in ("aq_reD", "aq_k", "aq_L")])) | {"nb_T"}
             rows = []
             for k in keys:
                 lab_, q, lo_, hi_ = PARAMS[k]
@@ -1205,6 +1271,8 @@ with t_reg:
                     a, b = 1.2, max(20.0, cur_ * 2)
                 if k == "aq_theta":
                     a, b = 10.0, 360.0
+                if k == "nb_T":
+                    a, b = max(cur_ * 0.02, lo_), min(cur_ * 50.0, hi_)
                 rows.append({"Regress": k in default_on, "Parameter": ulabel(lab_, q),
                              "Current value": U.to_disp(q, cur_, SYS),
                              "Minimum": U.to_disp(q, a, SYS), "Maximum": U.to_disp(q, b, SYS)})
@@ -1217,7 +1285,7 @@ with t_reg:
                     disabled=["Parameter", "Current value"],
                     column_config={c_: st.column_config.NumberColumn(format="%.5g")
                                    for c_ in ("Current value", "Minimum", "Maximum")},
-                    key=f"reg_{V['aq_model']}_{V['aq_geom']}_{V['aq_inf']}_{KEY}")
+                    key=f"reg_{V['aq_model']}_{V['aq_geom']}_{V['aq_inf']}_{V.get('nb_on')}_{KEY}")
                 LOSSES = {"Least squares": "linear", "Robust (soft-L1)": "soft_l1"}
                 c = st.columns([2, 3], vertical_alignment="bottom")
                 loss_lab = c[0].selectbox(
@@ -1230,14 +1298,14 @@ with t_reg:
                              + ("" if np.allclose(hist.w[hist.use], 1.0) else ", with unequal weights")
                              + ". Change them in Survey screening or in tab 2.")
                 go_btn = st.button("Run regression", type="primary")
-                if not AQ.active and DET["status"] == "aquifer":
+                if not AQ.active and not tank.has_neighbour and DET["status"] == "aquifer":
                     st.warning("An additional energy source was detected but no aquifer is defined. "
                                "Regression on G alone will not match the pressure trend; define the "
                                "aquifer in tab 5 first.")
 
             def make_sim(base, rk):
                 def sim(vals):
-                    return make_tank(dict(base, **dict(zip(rk, vals))), pvt, hist).simulate()[0]
+                    return make_tank(dict(base, **dict(zip(rk, vals))), pvt, hist, neighbour=NB).simulate()[0]
                 return sim
 
             if go_btn:

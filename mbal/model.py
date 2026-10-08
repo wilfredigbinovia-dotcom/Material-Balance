@@ -17,6 +17,7 @@ PARAMS = {
     "aq_kvkh":  ("Vertical anisotropy kv/kh", "ratio", 1e-5, 1.0),
     "aq_Wvol":  ("Aquifer water volume", "res_vol", 1e-3, 1e7),
     "aq_C":     ("Aquifer constant", "aq_const", 1e-3, 1e7),
+    "nb_T":     ("Transmissibility to neighbouring reservoir", "transmiss", 1e-4, 1e5),
 }
 
 
@@ -47,7 +48,12 @@ def make_aquifer(c):
         L=c["aq_L"], kvkh=c["aq_kvkh"], Wvol=c["aq_Wvol"] * 1e6, C=c["aq_C"])
 
 
-def make_tank(c, pvt, hist, with_aquifer=True):
+def make_tank(c, pvt, hist, with_aquifer=True, neighbour=None):
+    """neighbour: (t_days, p_psia) of a connected reservoir; used when c['nb_on'] is set, with
+    transmissibility c['nb_T'] in Mscf/day/psi. Left out together with the aquifer."""
     aq = make_aquifer(c) if with_aquifer else Aquifer()
+    nb = None
+    if with_aquifer and neighbour is not None and c.get("nb_on") and c.get("nb_T"):
+        nb = (neighbour[0], neighbour[1], c["nb_T"] * 1e3)
     return Tank(pvt, hist, G=c["G"] * 1e9, pi=c["pi"], swi=c["swi"], cf=c["cf"], cw=c["cw"],
-                bw=c["bw"], aquifer=aq)
+                bw=c["bw"], aquifer=aq, neighbour=nb)

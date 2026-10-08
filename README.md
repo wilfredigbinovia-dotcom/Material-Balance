@@ -21,7 +21,7 @@ The app opens in your browser with every input empty. Each tab lists what it sti
 3. **Reservoir parameters** - initial pressure, porosity, connate water, rock compressibility, first estimate of gas in place.
 4. **History match** - graphical plots (p/z, p/z overpressured, Havlena-Odeh overpressured, Havlena-Odeh water drive,
    Cole (F-We)/Et, Roach, Cole F/Et), analytical plot (pressure vs cumulative production), energy plot, WD function plot.
-5. **Aquifer** - automatic detection of an extra energy source, then model (small pot, Schilthuis, Hurst-van Everdingen,
+5. **Aquifer and neighbouring reservoir** - automatic detection of an extra energy source, then model (small pot, Schilthuis, Hurst-van Everdingen,
    Carter-Tracy, Fetkovich) and system (radial, linear, bottom drive).
 6. **Regression** - survey screening, then a least-squares or robust match of model pressure to
    history on any ticked parameters.
@@ -71,6 +71,10 @@ G is the wet (well-stream) gas initially in place.
 * Aquifer dimensionless functions (WD, pD) are computed by Stehfest inversion of the Laplace-space
   solutions, so any re/ro can be used without table look-up.
 * Bottom drive is modelled as vertical linear flow through the reservoir area (kv = k * kv/kh).
+* Neighbouring reservoir (tab 5): for a tank that leaks to or from another sand, gas crosses at
+  q = T (p_neighbour - p), with the neighbour's measured static pressures interpolated in time. The
+  balance becomes G (Eg + Efw) + We = (Gp,wet - Gx) Bg + Wp Bw, Gx being the cumulative gas received.
+  T can be regressed in tab 6. In the forecast the neighbour is held at its last surveyed pressure.
 * Aquifer detection: quadratic trend test (F-test) on the Cole no-aquifer plot F/Et vs Gp.
 
 ### Forecast method

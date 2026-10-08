@@ -107,7 +107,10 @@ def aggregate_wells(wells, pressures):
 
 
 class Tank:
-    def __init__(self, pvt: PVT, hist: History, G, pi, swi, cf, cw, bw=1.0, aquifer=None):
+    def __init__(self, pvt: PVT, hist: History, G, pi, swi, cf, cw, bw=1.0, aquifer=None,
+                 neighbour=None):
+        """neighbour: (t_days, p_psia, T) - a connected reservoir with a known pressure history.
+        Gas crosses at  q = T * (p_neighbour - p)  scf/day (into this tank when positive)."""
         self.pvt, self.h = pvt, hist
         self.G = G                      # scf wet gas
         self.pi, self.swi, self.cf, self.cw, self.bw = pi, swi, cf, cw, bw
@@ -120,6 +123,14 @@ class Tank:
         # Pressures that drive the aquifer: switched-off surveys are bridged by
         # interpolating in time between their neighbours.
         self.p_drive = np.interp(hist.t, hist.t[self.use], hist.p[self.use])
+        self.nb_T, self.nb_t, self.nb_p = 0.0, None, None
+        if neighbour is not None and neighbour[2] and len(neighbour[0]) >= 1:
+            o = np.argsort(neighbour[0])
+            self.nb_t = np.asarray(neighbour[0], float)[o]
+            self.nb_p = np.asarray(neighbour[1], float)[o]
+            self.nb_T = float(neighbour[2])
+        self.pn = self.neighbour_p(hist.t)
+        self.gx_sim = np.zeros(len(hist.t))
 
     # ---- MBE terms (vectorised on pressure)
     def Eg(self, p):
@@ -139,6 +150,39 @@ class Tank:
         """Aquifer influx driven by the measured pressures."""
         return self.aq.influx(self.h.t, self.p_drive)
 
+    # ---- neighbouring reservoir
+    @property
+    def has_neighbour(self):
+        return self.nb_T > 0
+
+    def neighbour_p(self, t):
+        """Neighbour pressure at times t: interpolated between its surveys, held flat outside."""
+        t = np.asarray(t, float)
+        if self.nb_t is None:
+            return np.full(t.shape, np.nan)
+        return np.interp(t, self.nb_t, self.nb_p)
+
+    def gx_step(self, i, p, gx, t=None, pn=None):
+        """Cumulative gas received from the neighbour (scf) at step i."""
+        if not self.has_neighbour:
+            return 0.0
+        t = self.h.t if t is None else t
+        pn = self.pn if pn is None else pn
+        # End-of-step pressure difference (implicit): stays stable when the link is strong
+        # and the steps are as long as the gaps between surveys.
+        return gx[i - 1] + self.nb_T * (pn[i] - p[i]) * (t[i] - t[i - 1])
+
+    def gx_history(self):
+        """Gas received from the neighbour, driven by the measured pressures (scf)."""
+        gx = np.zeros(len(self.h.t))
+        for i in range(1, len(gx)):
+            gx[i] = self.gx_step(i, self.p_drive, gx)
+        return gx
+
+    def support_history(self):
+        """Aquifer influx plus gas from the neighbour, rb, at the measured pressures."""
+        return self.We_history() + self.gx_history() * self.pvt.bg(self.p_drive)
+
     # ---- forward prediction of pressure from production
     def simulate(self):
         """Solve the MBE for pressure at every history step. Returns (p_sim, We_sim)."""
@@ -147,6 +191,7 @@ class Tank:
         aq.prepare(h.t)
         p = np.full(n, np.nan)
         We = np.zeros(n)
+        gx = np.zeros(n)
         p[0] = self.pi
         plo = max(self.pvt.p_range[0], 14.7)
         for i in range(1, n):
@@ -154,7 +199,7 @@ class Tank:
                 p[i] = pp
                 we = aq.we_at(i, p, We)
                 return (self.G * (self.Eg(pp) + self.Efw(pp)) + we
-                        - self.gpw[i] * self.pvt.bg(pp) - h.wp[i] * self.bw)
+                        - (self.gpw[i] - self.gx_step(i, p, gx)) * self.pvt.bg(pp) - h.wp[i] * self.bw)
             hi = self.pi
             try:
                 r_hi, r_lo = res(hi), res(plo)
@@ -169,9 +214,12 @@ class Tank:
             except ValueError:
                 p[i:] = np.nan
                 We[i:] = np.nan
+                gx[i:] = np.nan
                 break
             p[i] = sol
             We[i] = aq.we_at(i, p, We)
+            gx[i] = self.gx_step(i, p, gx)
+        self.gx_sim = gx
         return p, We
 
     # ---- drive indices
@@ -179,10 +227,14 @@ class Tank:
         p = self.p_drive
         we = self.We_history()
         a, b, c = self.G * self.Eg(p), self.G * self.Efw(p), np.maximum(we, 0.0)
-        tot = a + b + c
+        d = np.maximum(self.gx_history() * self.pvt.bg(p), 0.0)
+        tot = a + b + c + d
         with np.errstate(divide="ignore", invalid="ignore"):
-            return {"Gas expansion": a / tot, "Rock and connate water compressibility": b / tot,
-                    "Water influx": c / tot}
+            out = {"Gas expansion": a / tot, "Rock and connate water compressibility": b / tot,
+                   "Water influx": c / tot}
+            if self.has_neighbour:
+                out["Gas from neighbouring reservoir"] = d / tot
+            return out
 
 
 # ----------------------------------------------------------------- graphical methods
@@ -221,7 +273,7 @@ def graphical(tank: Tank, method, sel=None):
     dp = tank.pi - p
     F, Eg, Efw = tank.F(), tank.Eg(p), tank.Efw(p)
     Et = Eg + Efw
-    We = tank.We_history() if tank.aq.active else np.zeros(n)
+    We = tank.support_history() if (tank.aq.active or tank.has_neighbour) else np.zeros(n)
     nz = np.arange(n) > 0
     out = {"method": method, "G": None, "extra": {}, "mask": np.ones(n, bool)}
     with np.errstate(divide="ignore", invalid="ignore"):
