@@ -45,7 +45,8 @@ The sample case contains two deliberately bad surveys (160 and 180 psi high).
 
 7. **Relative permeability** - tank-scale Corey curves (gas-water, gas-condensate), with a fit of the water
    curve to the produced-water history after water vapour from the gas has been set aside.
-8. **Wells** - completion data, pressure limits and well tests. Tests may give flowing bottomhole pressure or
+8. **Wells** - completion data, pressure limits and well tests. Prosper lift-curve tables (.tpd) can be attached per well;
+   they replace the built-in tubing calculation and add Turner liquid-loading checks. Tests may give flowing bottomhole pressure or
    tubing-head pressure (converted with the tubing calculation). A back-pressure inflow equation is fitted per well.
 9. **Forecast** - the matched tank stepped forward under the well limits and an optional field rate target:
    gas, condensate and water rates, reservoir pressure, saturations and recovery.
@@ -91,7 +92,11 @@ G is the wet (well-stream) gas initially in place.
   follows from the material balance, including the aquifer.
 * The curves are tank averages (pseudo curves), not core curves. Trapped gas is represented by gas
   ceasing to flow as the tank water saturation approaches 1 - Sgrw.
-* Not modelled: liquid loading in the tubing, near-well condensate banking beyond the tank-average
+* Lift curves (.tpd): bottomhole pressure is interpolated linearly in tubing-head pressure and
+  water-gas ratio, and in the logarithm of rate and GOR (GOR = 10^6 / CGR). The operating point is
+  the highest-rate crossing of inflow and lift curve; no crossing means the well cannot lift its
+  liquids. Prosper writes pressures in psig; they are converted to psia on import.
+* Not modelled: liquid loading in the tubing for wells without lift curves, near-well condensate banking beyond the tank-average
   saturation, coning, and differences in water arrival between wells.
 
 ## Files
@@ -105,6 +110,7 @@ G is the wet (well-stream) gas initially in place.
     mbal/importer.py  production / pressure workbook import
     mbal/relperm.py   relative permeability, tank saturations, water fit
     mbal/wells.py     tubing pressure drop and inflow fit
+    mbal/vlp.py       Prosper .tpd lift-curve reader and interpolation
     mbal/forecast.py  forecast stepping
     mbal/model.py     configuration -> engine objects
     mbal/sample.py    synthetic sample case

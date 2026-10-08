@@ -5,6 +5,7 @@ Run with:   streamlit run app.py
 import datetime as dt
 import io
 import json
+import re
 
 import numpy as np
 import pandas as pd
@@ -23,6 +24,7 @@ from mbal.outliers import residual_screen, runs_test, trend_screen
 from mbal.regress import leave_one_out, pressure_rms, regress
 from mbal.relperm import RelPerm, TankState, fit_water, water_history
 from mbal.sample import default_config, sample_case, sample_wells
+from mbal.vlp import LiftTable, read_tpd
 from mbal.wells import Well, fit_ipr, tubing_bhp, well_rate
 
 st.set_page_config(page_title="Condensate Material Balance", page_icon="🛢️", layout="wide")
@@ -63,7 +65,8 @@ TABLES = {  # name -> [(column, label, quantity or None)]
     "tests": [("well", "Well", "text"), ("date", "Date", "date"), ("qg", "Gas rate", "gas_rate"),
               ("pwf", "Flowing bottomhole pressure", "pressure"),
               ("pth", "Flowing tubing-head pressure", "pressure"),
-              ("pr", "Reservoir pressure (optional)", "pressure")],
+              ("pr", "Reservoir pressure (optional)", "pressure"),
+              ("wgr", "Water-gas ratio (optional)", "cgr")],
 }
 
 
@@ -1588,6 +1591,62 @@ with t_wl:
                 except Exception as e:  # noqa: BLE001
                     st.warning(f"Could not read the file: {e}")
 
+        st.markdown("**Lift curves**")
+        st.caption("Optional. A Prosper lift-curve table (.tpd) replaces the built-in tubing "
+                   "calculation for its well: it carries the well model's multiphase correlation, so "
+                   "condensate and water in the tubing and liquid loading are included. Export the "
+                   "table with tubing-head pressure, water-gas ratio and total GOR as sensitivity "
+                   "variables. The .vlp file Prosper writes alongside is a binary copy of the same "
+                   "table; load the .tpd.")
+        V.setdefault("lift", {})
+        lift_names = [str(x).strip() for x in cfg_df["well"].dropna() if str(x).strip()]
+        choice("Pressures in the lift-curve files are", "lift_gauge",
+               {"psig": "psig (Prosper oilfield units)", "psia": "psia"}, horizontal=True)
+        ups = st.file_uploader("Lift-curve files", type=["tpd"], accept_multiple_files=True,
+                               key=f"up_lift_{ss.ver}")
+        pend = []
+        for f_ in ups or []:
+            try:
+                tab_ = read_tpd(f_.getvalue().decode("latin-1"), f_.name, V["lift_gauge"] == "psig")
+            except Exception as e:  # noqa: BLE001
+                st.warning(f"{f_.name}: {e}")
+                continue
+            toks = [t for t in re.split(r"[^0-9a-z]+", f_.name.lower().rsplit(".", 1)[0]) if t]
+            norm = lambda s: "".join(ch for ch in s.lower() if ch.isalnum())   # noqa: E731
+            hits = [n_ for n_ in lift_names if norm(n_)
+                    and any(t == norm(n_) or (len(norm(n_)) >= 2 and t.endswith(norm(n_))) for t in toks)]
+            guess = max(hits, key=len) if hits else None
+            opts = lift_names or ["(enter the wells in the table above first)"]
+            pick = st.selectbox(f"Well for {f_.name}", opts,
+                                index=opts.index(guess) if guess in opts else 0, key=f"lw_{f_.name}_{ss.ver}")
+            pend.append((pick, tab_))
+
+        def _attach(items):
+            for nm_, tb_ in items:
+                V["lift"][nm_] = tb_.to_dict()
+            refresh()
+        if pend and lift_names:
+            st.button(f"Attach {len(pend)} lift-curve table(s)", type="primary", on_click=_attach, args=(pend,))
+        if V["lift"]:
+            rows_l = []
+            for nm_, d_ in V["lift"].items():
+                rows_l.append({"Well": nm_, "File": d_.get("name", ""),
+                               "Correlation": d_.get("info", {}).get("correlation", ""),
+                               f"Rates ({U.label('gas_rate', SYS)})":
+                                   f"{U.to_disp('gas_rate', min(d_['q']), SYS):.3g} to {U.to_disp('gas_rate', max(d_['q']), SYS):.3g}",
+                               f"Tubing-head pressures ({PU})":
+                                   f"{U.to_disp('pressure', min(d_['thp']), SYS):,.0f} to {U.to_disp('pressure', max(d_['thp']), SYS):,.0f}",
+                               "Water-gas ratios (STB/MMscf)": f"{min(d_['wgr']):.4g} to {max(d_['wgr']):.4g}",
+                               "Condensate-gas ratios (STB/MMscf)": f"{1e6 / max(d_['gor']):.3g} to {1e6 / min(d_['gor']):.3g}"})
+            st.dataframe(pd.DataFrame(rows_l), hide_index=True, width="stretch")
+            c = st.columns([2, 1], vertical_alignment="bottom")
+            rm = c[0].selectbox("Remove lift curves from", list(V["lift"]), key=f"lrm_{KEY}")
+
+            def _rm(nm_):
+                V["lift"].pop(nm_, None)
+                refresh()
+            c[1].button("Remove", on_click=_rm, args=(rm,))
+
     if not READY:
         with right:
             need_data()
@@ -1603,6 +1662,13 @@ with t_wl:
         M_H = STATE.mobility(RP, P_SIM, SW_H)
         cgr_now = float(pvt.cgr(P_SIM[-1])) if np.nanmax(pvt.cgr_tab) > 0 else V["cgr_i"]
         CGR_CONST = None if np.nanmax(pvt.cgr_tab) > 0 else V["cgr_i"]
+        # field water-gas ratio over each history interval (STB/MMscf), for tests without one
+        with np.errstate(divide="ignore", invalid="ignore"):
+            WGR_H = np.diff(hist.wp) / np.diff(hist.gp) * 1e6
+        WGR_H = np.nan_to_num(np.concatenate([WGR_H[:1], WGR_H]), nan=0.0)
+        sw_now = float(SW_H[-1])
+        WGR_NOW = (float(STATE.wgr_free(RP, P_SIM[-1], sw_now)) * (1.0 + GE * cgr_now / 1e6)
+                   + (float(STATE.wgr_vapour(P_SIM[-1])) if V["rp_vap"] else 0.0))
         tdf = tests_df.dropna(subset=["well", "qg"]).copy()
         tdf["well"] = tdf["well"].astype(str).str.strip()
         names = [str(x).strip() for x in cfg_df["well"].dropna() if str(x).strip()]
@@ -1614,6 +1680,8 @@ with t_wl:
             w = Well(nm, tvd=_f(r.get("tvd")), md=_f(r.get("md")), tid=_f(r.get("tid")),
                      wht=_f(r.get("wht")), min_thp=_f(r.get("min_thp")), min_bhp=_f(r.get("min_bhp")),
                      qmax=_f(r.get("qmax")))
+            if nm in V.get("lift", {}):
+                w.lift = LiftTable.from_dict(V["lift"][nm])
             qs, xs, skipped = [], [], 0
             for t_ in tdf[tdf["well"] == nm].itertuples():
                 day = ((pd.Timestamp(t_.date) - pd.Timestamp(V["start_date"])).days
@@ -1621,11 +1689,14 @@ with t_wl:
                 pr_ = (_f(t_.pr) if np.isfinite(_f(t_.pr))
                        else float(np.interp(day, hist.t[hist.use], hist.p[hist.use])))
                 m_ = float(np.interp(day, hist.t, M_H))
-                wet_ = 1.0 + GE * (float(pvt.cgr(pr_)) if CGR_CONST is None else CGR_CONST) / 1e6
+                cgr_ = float(pvt.cgr(pr_)) if CGR_CONST is None else CGR_CONST
+                wet_ = 1.0 + GE * cgr_ / 1e6
+                wgr_ = (_f(getattr(t_, "wgr", np.nan)) if np.isfinite(_f(getattr(t_, "wgr", np.nan)))
+                        else float(np.interp(day, hist.t, WGR_H)))
                 if np.isfinite(_f(t_.pwf)):
                     pwf_ = _f(t_.pwf)
                 elif np.isfinite(_f(t_.pth)) and w.has_tubing:
-                    pwf_ = tubing_bhp(_f(t_.pth), _f(t_.qg), GZ, V["T"], w, wet_)
+                    pwf_ = tubing_bhp(_f(t_.pth), _f(t_.qg), GZ, V["T"], w, wet_, cgr_, wgr_)
                 else:
                     skipped += 1
                     continue
@@ -1642,7 +1713,7 @@ with t_wl:
             PTS[nm] = (np.array(qs), np.array(xs))
             WELLS.append(w)
             wet_now = 1.0 + GE * cgr_now / 1e6
-            q_now, pwf_now = well_rate(w, P_SIM[-1], M_H[-1], GZ, V["T"], wet_now)
+            q_now, pwf_now, load_now = well_rate(w, P_SIM[-1], M_H[-1], GZ, V["T"], wet_now, cgr_now, WGR_NOW)
             aof = w.C * (M_H[-1] * P_SIM[-1] ** 2) ** w.n if np.isfinite(w.C) else np.nan
             rows.append({"Well": nm, "Tests used": w.n_tests,
                          "C": w.C, "n": w.n,
@@ -1650,6 +1721,9 @@ with t_wl:
                          f"Rate at limit now ({U.label('gas_rate', SYS)})": U.to_disp("gas_rate", q_now, SYS),
                          f"Flowing BHP at limit ({PU})": U.to_disp("pressure", pwf_now, SYS),
                          "Limit": {"thp": "tubing head", "bhp": "bottomhole", None: "none"}[w.control],
+                         "Tubing": ("lift curves" if w.lift is not None else
+                                    "built-in" if w.has_tubing else "-"),
+                         "Loading now": ("yes" if load_now else "no") if w.lift is not None else "-",
                          "Note": w.note})
         with right:
             if not WELLS:
@@ -1673,13 +1747,46 @@ with t_wl:
                 st.caption("Deliverability plot. Each line is q = C · [M (pr² − pwf²)]ⁿ fitted to that "
                            "well's tests; M corrects for the change in gas mobility since initial "
                            "conditions.")
+                op_w = [w for w in WELLS if np.isfinite(w.C) and w.control == "thp"]
+                if op_w:
+                    wsel = st.selectbox("Operating point now for", [w.name for w in op_w], key=f"opw_{KEY}")
+                    w = next(x for x in op_w if x.name == wsel)
+                    pr_n, m_n = P_SIM[-1], M_H[-1]
+                    wet_n = 1.0 + GE * cgr_now / 1e6
+                    qmax_ = w.C * (m_n * pr_n ** 2) ** w.n
+                    qq = np.geomspace(max(qmax_ * 1e-3, 0.05), qmax_, 80)
+                    ipr_p = np.sqrt(np.maximum(pr_n ** 2 - (qq / w.C) ** (1 / w.n) / m_n, 0.0))
+                    vlp_p = np.array([tubing_bhp(w.min_thp, x, GZ, V["T"], w, wet_n, cgr_now, WGR_NOW) for x in qq])
+                    f = figure(f"Gas rate ({U.label('gas_rate', SYS)})", f"Flowing bottomhole pressure ({PU})", height=340)
+                    f.add_trace(go.Scatter(x=U.to_disp("gas_rate", qq, SYS), y=U.to_disp("pressure", ipr_p, SYS),
+                                           mode="lines", name="Inflow", line=dict(color=BLUE, width=2)))
+                    f.add_trace(go.Scatter(x=U.to_disp("gas_rate", qq, SYS), y=U.to_disp("pressure", vlp_p, SYS),
+                                           mode="lines", name="Lift" + (" (table)" if w.lift is not None else " (built-in)"),
+                                           line=dict(color=ORANGE, width=2)))
+                    if w.lift is not None:
+                        ld = np.array([w.lift.loading_at(w.min_thp, x, WGR_NOW, cgr_now) for x in qq])
+                        if ld.any():
+                            f.add_trace(go.Scatter(x=U.to_disp("gas_rate", qq[ld], SYS),
+                                                   y=U.to_disp("pressure", vlp_p[ld], SYS), mode="markers",
+                                                   name="Below Turner rate", marker=dict(color=RED, size=5)))
+                    qo, po, lo_ = well_rate(w, pr_n, m_n, GZ, V["T"], wet_n, cgr_now, WGR_NOW)
+                    if qo > 0:
+                        f.add_trace(go.Scatter(x=[U.to_disp("gas_rate", qo, SYS)], y=[U.to_disp("pressure", po, SYS)],
+                                               mode="markers", name="Operating point",
+                                               marker=dict(color=AQUA, size=13, symbol="diamond")))
+                    show(f, "opp")
+                    st.caption(f"At today's model reservoir pressure ({U.to_disp('pressure', pr_n, SYS):,.0f} {PU}), "
+                               f"tubing-head pressure {U.to_disp('pressure', w.min_thp, SYS):,.0f} {PU}, "
+                               f"condensate-gas ratio {cgr_now:.1f} and water-gas ratio {WGR_NOW:.2f} STB/MMscf. "
+                               + ("No crossing: the well cannot lift its liquids at this pressure." if qo <= 0 else ""))
         if rows:
             st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch",
                          column_config={"C": st.column_config.NumberColumn(format="%.3e"),
                                         "n": st.column_config.NumberColumn(format="%.2f")})
-            st.caption("Tubing pressure drop uses single-phase gas with the well-stream gravity. "
-                       "Liquid loading is not modelled, so rates close to the end of a well's life "
-                       "are optimistic.")
+            st.caption("Wells without lift curves use the built-in tubing calculation: single-phase gas "
+                       "with the well-stream gravity and no liquid loading, so their late-life rates are "
+                       "optimistic. Tests without a water-gas ratio use the field value from the "
+                       "production history at the test date.")
 
 # ============================================================ 9. Forecast
 with t_fc:
@@ -1690,6 +1797,11 @@ with t_fc:
         help="Wells are choked back in proportion when together they can deliver more. "
              "Empty means every well produces at its own limit.")
     num("Stop below field gas rate (optional)", "fc_qmin", "gas_rate", c[3], minv=0.0)
+    V["fc_stop_load"] = st.checkbox(
+        "Shut in a well when it loads up with liquid (wells with lift curves)",
+        value=bool(V.get("fc_stop_load", True)), key=f"cb_load_{KEY}",
+        help="Uses the Turner critical-velocity flag in the lift-curve table. Unticked, a loading "
+             "well keeps producing at the rate the curves give.")
     active = [w for w in WELLS if np.isfinite(w.C) and w.control is not None]
     if not READY:
         need_data()
@@ -1703,7 +1815,8 @@ with t_fc:
         try:
             dt_ = {"Monthly": 30.4375, "Quarterly": 91.3125, "Yearly": 365.25}[V["fc_step"]]
             FC, FS = forecast(tank, P_SIM, WE_SIM, active, RP, STATE, GZ, V["fc_years"] * 365.25, dt_,
-                              V["fc_qtarget"], V["fc_qmin"], V["rp_vap"], CGR_CONST)
+                              V["fc_qtarget"], V["fc_qmin"], V["rp_vap"], CGR_CONST,
+                              bool(V.get("fc_stop_load", True)))
         except Exception as e:  # noqa: BLE001
             FC = None
             st.warning(str(e))
@@ -1725,6 +1838,14 @@ with t_fc:
             c[4].metric(f"Reservoir pressure at end ({PU})", f"{U.to_disp('pressure', FS['p_end'], SYS):,.0f}")
             (st.warning if FS["stopped"] else st.info)(
                 f"Forecast ends {end_date}: {FS['reason']}.")
+            ld_msgs = []
+            for w in active:
+                lcol = FC[f"load_{w.name}"].to_numpy(bool) & fut
+                if lcol.any():
+                    ld_msgs.append(f"{w.name} from {fdates[np.argmax(lcol)].date()}")
+            if ld_msgs:
+                st.caption("Below the Turner critical rate (liquid loading): " + "; ".join(ld_msgs)
+                           + (". Those wells are shut in at that point." if V.get("fc_stop_load", True) else "."))
             if n0 == len(FC):
                 st.warning("No forecast steps could be taken: the wells cannot flow against their "
                            "limits at the current reservoir pressure. Check tab 8.")

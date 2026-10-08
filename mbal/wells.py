@@ -7,7 +7,8 @@ Inflow (back-pressure equation, corrected for changing reservoir conditions)
 Tubing (average temperature and Z method, single-phase gas with the well-stream gravity)
     pwf^2 = e^s pth^2 + 6.67e-4 q^2 f T^2 z^2 (e^s - 1) (MD/TVD) / d^5
     s = 0.0375 * gravity * TVD / (T z)          q in Mscf/d, T in degR, d in inches
-Liquid loading is not modelled: at low rates the true bottomhole pressure is higher.
+A well can instead use imported lift curves (Prosper .tpd, see vlp.py), which carry the
+well model's multiphase correlation and its Turner liquid-loading check.
 """
 from dataclasses import dataclass
 import numpy as np
@@ -30,10 +31,11 @@ class Well:
     qmax: float = np.nan       # MMscf/d separator gas
     n_tests: int = 0
     note: str = ""
+    lift: object = None        # LiftTable, replaces the built-in tubing calculation
 
     @property
     def has_tubing(self):
-        return all(np.isfinite(v) and v > 0 for v in (self.tvd, self.tid, self.wht))
+        return self.lift is not None or all(np.isfinite(v) and v > 0 for v in (self.tvd, self.tid, self.wht))
 
     @property
     def control(self):
@@ -45,9 +47,13 @@ class Well:
         return None
 
 
-def tubing_bhp(pth, q_mmscfd, gz, t_res, well, wet=1.0):
+def tubing_bhp(pth, q_mmscfd, gz, t_res, well, wet=1.0, cgr=0.0, wgr=0.0):
     """Flowing bottomhole pressure from tubing-head pressure. q is separator gas; `wet`
-    scales it to well-stream gas so that the produced condensate is carried too."""
+    scales it to well-stream gas so that the produced condensate is carried too.
+    With lift curves, the table is read at the condensate-gas and water-gas ratios
+    (STB/MMscf) instead."""
+    if well.lift is not None:
+        return well.lift.bhp_at(pth, q_mmscfd, wgr, cgr)
     tvd = well.tvd
     md = well.md if np.isfinite(well.md) and well.md >= tvd else tvd
     tbar = 0.5 * (well.wht + t_res)
@@ -95,28 +101,56 @@ def fit_ipr(q, x):
     return C, n, note
 
 
-def well_rate(well, pr, M, gz, t_res, wet=1.0):
-    """Separator gas rate (MMscf/d) and flowing bottomhole pressure at the well's limit."""
+def well_rate(well, pr, M, gz, t_res, wet=1.0, cgr=0.0, wgr=0.0, stop_loading=False):
+    """Separator gas rate (MMscf/d), flowing bottomhole pressure and liquid-loading flag at the
+    well's limit.
+
+    Against a tubing-head pressure limit the operating point is the highest-rate crossing of
+    the inflow curve and the lift curve, which is the stable one when the lift curve turns up
+    at low rate. If the curves do not cross, the well cannot lift its liquids and is dead.
+    Loading is flagged when the lift curves report the gas velocity below Turner's critical
+    velocity; with stop_loading the well is then shut in.
+    """
     if not np.isfinite(well.C) or well.control is None or M <= 0 or not np.isfinite(pr):
-        return 0.0, np.nan
+        return 0.0, np.nan, False
 
     def ipr(pwf):
         return well.C * max(M * (pr * pr - pwf * pwf), 0.0) ** well.n
 
+    loading = False
     if well.control == "bhp":
         pwf = well.min_bhp
         q = ipr(pwf)
     else:
-        if tubing_bhp(well.min_thp, 0.0, gz, t_res, well, wet) >= pr:
-            return 0.0, np.nan
-        f = lambda qq: ipr(tubing_bhp(well.min_thp, qq, gz, t_res, well, wet)) - qq   # noqa: E731
+        def vlp(qq):
+            return tubing_bhp(well.min_thp, qq, gz, t_res, well, wet, cgr, wgr)
+
         hi = ipr(0.0)
-        q = brentq(f, 0.0, hi, xtol=1e-4) if f(hi) < 0 else hi
-        pwf = tubing_bhp(well.min_thp, q, gz, t_res, well, wet)
+        if hi <= 0:
+            return 0.0, np.nan, False
+        f = lambda qq: ipr(vlp(qq)) - qq     # noqa: E731
+        lo = 1e-3 if well.lift is None else min(float(well.lift.q[0]), hi * 0.5)
+        grid = np.geomspace(lo, hi, 40)
+        fv = np.array([f(x) for x in grid])
+        cross = np.where((fv[:-1] > 0) & (fv[1:] <= 0))[0]
+        if fv[-1] > 0:                       # inflow still above at open flow (cannot happen)
+            q = hi
+        elif len(cross):
+            k = cross[-1]
+            q = brentq(f, grid[k], grid[k + 1], xtol=1e-5)
+        else:
+            return 0.0, np.nan, False        # no crossing: the well is dead
+        pwf = vlp(q)
         if np.isfinite(well.min_bhp) and pwf < well.min_bhp:
             pwf, q = well.min_bhp, ipr(well.min_bhp)
+        if well.lift is not None:
+            loading = well.lift.loading_at(well.min_thp, q, wgr, cgr)
+            if loading and stop_loading:
+                return 0.0, np.nan, True
     if np.isfinite(well.qmax) and q > well.qmax:
         q = well.qmax
         # choked back: bottomhole pressure follows from the inflow equation
         pwf = float(np.sqrt(max(pr * pr - (q / well.C) ** (1.0 / well.n) / M, 0.0)))
-    return float(q), float(pwf)
+        if well.lift is not None:
+            loading = well.lift.loading_at(well.min_thp, q, wgr, cgr)
+    return float(q), float(pwf), bool(loading)

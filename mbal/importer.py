@@ -116,6 +116,7 @@ TEST_KEYS = [("well", ("well", "string", "completion")), ("date", ("date", "time
              ("pwf", ("bhp", "pwf", "bottom", "downhole", "gauge")),
              ("pth", ("thp", "whp", "tubing", "wellhead", "well head", "pth", "head")),
              ("pr", ("reservoir", "static", "shut", "average")),
+             ("wgr", ("wgr", "water")),
              ("qg", ("gas", "rate", "qg"))]
 
 
@@ -139,9 +140,9 @@ def read_tests(raw, filename):
         d = pd.DataFrame({k: df[v] for k, v in cols.items()})
         d["well"] = d["well"].astype(str).str.strip() if "well" in d else "Well"
         d["date"] = pd.to_datetime(d["date"], errors="coerce") if "date" in d else pd.NaT
-        for k in ("qg", "pwf", "pth", "pr"):
+        for k in ("qg", "pwf", "pth", "pr", "wgr"):
             d[k] = pd.to_numeric(d[k], errors="coerce") if k in d else np.nan
-        out.append(d.dropna(subset=["qg"])[["well", "date", "qg", "pwf", "pth", "pr"]])
+        out.append(d.dropna(subset=["qg"])[["well", "date", "qg", "pwf", "pth", "pr", "wgr"]])
     if not out:
         raise ValueError("No well test sheet found: it needs a gas rate column and a flowing "
                          "bottomhole or tubing-head pressure column.")

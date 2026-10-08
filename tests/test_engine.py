@@ -201,7 +201,7 @@ def test_tubing_and_inflow_fit():
     assert fit_ipr([5.0], [1e6])[1] == 1.0
     # rate at a tubing-head limit satisfies inflow and tubing together, and falls with pressure
     w.C, w.n, w.min_thp = C, n, 800.0
-    q, pwf = well_rate(w, 4000.0, 1.0, gz, 220.0)
+    q, pwf, _ = well_rate(w, 4000.0, 1.0, gz, 220.0)
     assert abs(q - C * (4000.0 ** 2 - pwf ** 2) ** n) < 1e-3
     assert abs(pwf - tubing_bhp(800.0, q, gz, 220.0, w)) < 1.0
     assert well_rate(w, 3000.0, 1.0, gz, 220.0)[0] < q
@@ -302,6 +302,71 @@ def test_neighbouring_reservoir():
     df, s = forecast(hi, p_hi, hi.simulate()[1], [w], rp, state, gz, 5 * 365.25)
     df0, s0 = forecast(tank0, p0, we0, [w], rp, state, gz, 5 * 365.25)
     assert df.gx.iloc[-1] > df.gx.iloc[len(h.t) - 1] and s["gp_end"] > s0["gp_end"]
+
+
+def _tpd_text(fun, q, thp, wgr, gor, psig=True):
+    """A Prosper-style .tpd file made from fun(thp, q, wgr, gor) -> (bhp, turner flag)."""
+    off = 14.696 if psig else 0.0
+    j = lambda v: ", ".join(f"{x:.6g}" for x in v)   # noqa: E731
+    out = ["# TPD test", "TPDData", "2", "2,0,2,0", "0,0", "58.5,0.7,3.4e+35,3.4e+35,30,9000", "3",
+           f"{len(q)}, {len(wgr)}, {len(gor)}, {len(thp)}", "2", "5000, 5105", "4002,18,15,27",
+           j(q), j(wgr), j(gor), j(np.asarray(thp) - off)]
+    for a in thp:
+        for b in gor:
+            for c in wgr:
+                for d in q:
+                    bhp, tur = fun(a, d, c, b)
+                    out.append(f"{bhp - off:.4f}, {int(tur)}")
+    return "\r\n".join(out)
+
+
+def test_lift_curves():
+    from mbal.pvt import GasZ
+    from mbal.vlp import read_tpd, LiftTable
+    from mbal.wells import Well, tubing_bhp, well_rate
+    gz = GasZ(0.7)
+    pipe = Well("p", tvd=9000.0, tid=2.441, wht=120.0)
+    q = np.geomspace(0.1, 30, 15)
+    thp, wgr, gor = [100.0, 600.0, 1100.0, 1600.0], [0.0, 50.0, 200.0], [5000.0, 20000.0, 100000.0]
+
+    # 1. a table made from the built-in tubing calculation reads back exactly at grid points
+    #    and closely in between (linear in THP and WGR, logarithmic in rate and GOR)
+    def fun(a, d, c, b):
+        return tubing_bhp(a, d, gz, 200.0, pipe) * (1 + c / 1000.0) + 2e5 / b, d < 1.0
+    t = read_tpd(_tpd_text(fun, q, thp, wgr, gor), "x.tpd")
+    assert t.bhp.shape == (4, 3, 3, 15) and np.allclose(t.thp, thp) and t.info["pressure_units"] == "psig"
+    assert abs(t.bhp_at(600.0, q[7], 50.0, 1e6 / 20000.0) - fun(600.0, q[7], 50.0, 20000.0)[0]) < 0.01
+    mid = t.bhp_at(850.0, 5.0, 25.0, 1e6 / 20000.0)
+    assert abs(mid / fun(850.0, 5.0, 25.0, 20000.0)[0] - 1) < 0.03     # coarse 500 psi THP grid
+    assert t.loading_at(600.0, 0.5, 0.0, 20.0) and not t.loading_at(600.0, 5.0, 0.0, 20.0)
+    assert t.bhp_at(50.0, 5.0, 0.0, 20.0) == t.bhp_at(100.0, 5.0, 0.0, 20.0)    # held at the edge
+    assert abs(LiftTable.from_dict(t.to_dict()).bhp_at(900, 3, 10, 30) - t.bhp_at(900, 3, 10, 30)) < 0.05
+    # a well using the table reproduces the built-in result (WGR 0, high GOR term small)
+    w_tab = Well("t", C=2e-5, n=0.8, min_thp=600.0, lift=t)
+    w_pipe = Well("p", C=2e-5, n=0.8, min_thp=600.0, tvd=9000.0, tid=2.441, wht=120.0)
+    q_tab = well_rate(w_tab, 3500.0, 1.0, gz, 200.0, cgr=10.0)[0]
+    q_pipe = well_rate(w_pipe, 3500.0, 1.0, gz, 200.0)[0]
+    assert abs(q_tab / q_pipe - 1) < 0.03
+
+    # 2. a lift curve that turns up at low rate (liquid loading): the well flows at the
+    #    high-rate crossing, and dies when the inflow no longer reaches the curve
+    def ushape(a, d, c, b):
+        return a + 900.0 + 1500.0 / d + 4.0 * d * d, d < 3.0
+    u = read_tpd(_tpd_text(ushape, q, thp, wgr, gor), "u.tpd")
+    w = Well("u", C=1e-4, n=0.8, min_thp=600.0, lift=u)
+    qq, pwf, load = well_rate(w, 3000.0, 1.0, gz, 200.0, cgr=20.0)
+    vl = lambda x: u.bhp_at(600.0, x, 0.0, 20.0)                                   # noqa: E731
+    assert qq > 3.0 and abs(pwf - vl(qq)) < 0.5 and not load
+    assert abs(qq - w.C * (3000.0 ** 2 - pwf ** 2) ** w.n) < 1e-3
+    assert well_rate(w, 1400.0, 1.0, gz, 200.0, cgr=20.0)[0] == 0.0
+    # a weak well whose operating point is below the Turner rate is flagged, and shut in on request
+    u2 = read_tpd(_tpd_text(lambda a, d, c, b: (ushape(a, d, c, b)[0], d < 6.0), q, thp, wgr, gor))
+    w2 = Well("u2", C=2.5e-6, n=1.0, min_thp=100.0, lift=u2)
+    q2, _, l2 = well_rate(w2, 1900.0, 1.0, gz, 200.0, cgr=20.0)
+    assert 0 < q2 < 6.0 and l2
+    assert not well_rate(Well("u3", C=1e-5, n=1.0, min_thp=100.0, lift=u2), 1900.0, 1.0, gz, 200.0,
+                         cgr=20.0)[2]
+    assert well_rate(w2, 1900.0, 1.0, gz, 200.0, cgr=20.0, stop_loading=True)[0] == 0.0
 
 
 if __name__ == "__main__":
