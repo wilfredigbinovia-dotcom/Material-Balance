@@ -386,6 +386,23 @@ def test_lift_curves():
     assert well_rate(w2, 1900.0, 1.0, gz, 200.0, cgr=20.0, stop_loading=True)[0] == 0.0
 
 
+
+def test_cce_two_phase_z():
+    import pandas as pd
+    from mbal.pvt import cce_two_phase_z
+    # Oredo-9 A8.0 report (CCE at 180 F): Zd = 0.952 at 4224 psia
+    d = pd.DataFrame({"p": [5515, 4835, 4224, 3475, 2427, 1705],
+                      "vr": [0.8824, 0.9373, 1.0, 1.1249, 1.4811, 2.0752]})
+    out, notes = cce_two_phase_z(d, 4224.0, 0.952)
+    assert not notes
+    # above the dew point the formula must give back the reported single-phase Z
+    assert abs(out.z.iloc[0] - 1.097) < 0.002 and abs(out.z.iloc[1] - 1.021) < 0.002
+    assert out.z.iloc[2] == 0.952
+    assert np.allclose(out.z, 0.952 * out.p / 4224.0 * out.vr)
+    bad = cce_two_phase_z(d.assign(vr=d.vr * 1.02), 4224.0, 0.952)[1]
+    assert any("not 1" in m for m in bad)
+
+
 if __name__ == "__main__":
     for k, v in list(globals().items()):
         if k.startswith("test_"):

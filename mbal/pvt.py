@@ -207,6 +207,37 @@ def cvd_two_phase_z(df, p_dew, z_dew=None):
     return out, z_dew, notes
 
 
+
+def cce_two_phase_z(df, p_dew, z_dew):
+    """Two-phase Z from a constant composition (constant mass) expansion:
+
+        Z2 = Zd * (p / pd) * Vr        Vr = V / Vd, relative volume
+
+    The cell keeps all its moles, so pV/Z is constant and the formula holds above the dew
+    point too (where it returns the single-phase Z). z_dew is the gas Z at the dew point.
+    Returns (DataFrame[p, vr, z], list of warnings).
+    """
+    if not z_dew or z_dew <= 0:
+        raise ValueError("The gas Z-factor at the dew point is needed for the CCE calculation.")
+    d = df.copy()
+    for col in ("p", "vr"):
+        d[col] = pd.to_numeric(d[col], errors="coerce") if col in d else np.nan
+    d = d.dropna(subset=["p", "vr"]).drop_duplicates("p").sort_values("p", ascending=False)
+    d = d[(d["p"] > 0) & (d["vr"] > 0)].reset_index(drop=True)
+    if d.empty:
+        raise ValueError("Enter the CCE pressures and relative volumes.")
+    notes = []
+    near = d[(d["p"] - p_dew).abs() <= 0.003 * p_dew]
+    if len(near) and abs(float(near["vr"].iloc[0]) - 1.0) > 0.005:
+        notes.append(f"The relative volume at the dew point is {float(near['vr'].iloc[0]):.4f}, not 1. "
+                     "Check that the volumes are relative to the dew point volume.")
+    if np.any(np.diff(d["vr"].to_numpy()) < -1e-9):
+        notes.append("The relative volume should rise steadily as pressure falls. Check the column.")
+    z = z_dew * d["p"].to_numpy() / p_dew * d["vr"].to_numpy()
+    if np.any((z < 0.3) | (z > 2.5)):
+        notes.append("Some calculated Z values are outside 0.3 to 2.5.")
+    return pd.DataFrame({"p": d["p"], "vr": d["vr"], "z": z}), notes
+
 # ----------------------------------------------------------------- PVT object
 @dataclass
 class PVT:

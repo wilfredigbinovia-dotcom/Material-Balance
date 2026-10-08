@@ -12,7 +12,7 @@ from .model import make_tank
 TRUTH = {"G": 250.0, "aq_reD": 5.0, "aq_k": 40.0}
 
 FLUID = dict(sg=0.72, cgr_i=85.0, api=52.0, T=260.0, pd=5200.0, co2=0.02, h2s=0.0, n2=0.01,
-             salinity=30000.0, z2="rayes", cvd_zd=0.0)
+             salinity=30000.0, z2="rayes", cvd_zd=0.0, z2_src="cce")
 
 
 def default_config():

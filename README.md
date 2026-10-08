@@ -65,6 +65,8 @@ G is the wet (well-stream) gas initially in place.
 
 * Single-phase Z: Dranchuk-Abou-Kassem, Sutton pseudo-criticals, Wichert-Aziz correction.
 * Two-phase Z: Rayes-Piper-McCain-Poston (1992), scaled to be continuous at the dew point.
+* Two-phase Z from a CCE (constant mass) study: Z2 = Zd (p / pd) Vr, Vr = V / Vd. The same formula gives
+  the single-phase Z above the dew point.
 * Two-phase Z from a CVD report: Z2 = p / [(pd/Zd)(1 - Gp)], Gp = cumulative well-stream produced as a
   fraction of the fluid at the dew point, Zd = gas Z at the dew point. The retrograde liquid volume SL and
   the equilibrium gas Z are used as a check: the liquid moles left, (1 - Gp) - (p/Zg)(1 - SL)/(pd/Zd),

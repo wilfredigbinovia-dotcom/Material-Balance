@@ -18,7 +18,7 @@ from mbal.matbal import METHODS, aggregate_wells, build_history, detect_drive, g
 from mbal.forecast import forecast
 from mbal.importer import DATE_FMT, parse_dates, parse_workbook, read_tests, reservoir_tables
 from mbal.model import PARAMS, aquifer_params, make_aquifer, make_tank
-from mbal.pvt import (GasZ, PVT, condensate_props, correlation_table, cvd_two_phase_z, gas_equivalent, hall_cf,
+from mbal.pvt import (GasZ, PVT, cce_two_phase_z, condensate_props, correlation_table, cvd_two_phase_z, gas_equivalent, hall_cf,
                       water_props, wet_gas_gravity)
 from mbal.outliers import residual_screen, runs_test, trend_screen
 from mbal.regress import leave_one_out, pressure_rms, regress
@@ -46,6 +46,7 @@ SURVEY = [("use", "Use", "bool"), ("w", "Weight", "weight")]   # pressure survey
 TABLES = {  # name -> [(column, label, quantity or None)]
     "pvt": [("p", "Pressure", "pressure"), ("z", "Z-factor (two-phase below dew point)", None),
             ("cgr", "Producing CGR (optional)", "cgr")],
+    "cce": [("p", "Pressure", "pressure"), ("vr", "Relative volume V/Vd", None)],
     "cvd": [("p", "Pressure", "pressure"), ("sl", "Retrograde liquid (% of volume at dew point)", None),
             ("gp", "Cum. produced fluid (mol % of initial)", None),
             ("zg", "Gas Z-factor (single phase)", None)],
@@ -448,17 +449,50 @@ with t_pvt:
             st.button("Generate table (replaces current table)", on_click=_fill_pvt,
                       disabled=bool(FLUID_MISS) or V["pvt_pmax"] is None,
                       help="Needs the fluid description above and the maximum table pressure.")
-        with st.expander("Calculate two-phase Z from a CVD report"):
-            st.caption("For reports that give retrograde liquid deposit, cumulative produced "
-                       "fluid and the single-phase (equilibrium gas) Z instead of the two-phase "
-                       "Z. Enter the CVD rows, including the dew point row if the report has it. "
-                       "Rows above the dew point need only pressure and gas Z.")
+        with st.expander("Calculate two-phase Z from a lab report"):
+            V.setdefault("z2_src", "cce")
+            choice("Calculate from", "z2_src",
+                   {"cce": "Constant composition expansion (CCE): relative volume",
+                    "cvd": "Constant volume depletion (CVD): cumulative produced fluid"})
+            num("Gas Z-factor at the dew point", "cvd_zd", None, step=0.01, minv=0.0, maxv=3.0,
+                help="Needed for the CCE calculation. For the CVD calculation it can be left empty "
+                     "and is then read from the CVD table's dew point row.")
+            CVD_OUT = None
+            if V["z2_src"] == "cce":
+                st.caption("Z2 = Zd · (p / pd) · Vr, with Vr the relative volume V/Vd from the CCE "
+                           "(constant mass) study. Enter the CCE rows; rows above the dew point give "
+                           "the single-phase Z by the same formula.")
+                cce_df = table("cce", height=260)
+                csv_upload("cce", "", expander=False)
+                if cce_df["p"].notna().any():
+                    if V["pd"] is None:
+                        st.info("Enter the dew point pressure under Fluid description first.")
+                    elif not V["cvd_zd"]:
+                        st.info("Enter the gas Z-factor at the dew point.")
+                    else:
+                        try:
+                            CVD_OUT, cce_notes = cce_two_phase_z(cce_df, V["pd"], V["cvd_zd"])
+                            st.dataframe(
+                                pd.DataFrame({ulabel("Pressure", "pressure"): U.to_disp("pressure", CVD_OUT["p"], SYS),
+                                              "Relative volume": CVD_OUT["vr"],
+                                              "Z": CVD_OUT["z"].round(4)}),
+                                hide_index=True, width="stretch", height=220)
+                            for m in cce_notes:
+                                st.warning(m)
+                        except Exception as e:  # noqa: BLE001
+                            st.warning(str(e))
+                st.caption("The CVD table below is still used for the retrograde liquid saturation "
+                           "in tab 7.")
+            else:
+                st.caption("Z2 = p / [(pd/Zd)(1 − Gp)], Gp the cumulative produced fluid from the CVD "
+                           "study. Enter the CVD rows, including the dew point row if the report has "
+                           "it. Rows above the dew point need only pressure and gas Z.")
+            st.markdown("**CVD data**")
             cvd_df = table("cvd", height=260)
             csv_upload("cvd", "", expander=False)
-            num("Gas Z-factor at the dew point (empty = take from the table)", "cvd_zd", None,
-                step=0.01, minv=0.0, maxv=3.0)
-            CVD_OUT = None
-            if cvd_df["p"].notna().any() and V["pd"] is None:
+            if V["z2_src"] == "cce":
+                pass
+            elif cvd_df["p"].notna().any() and V["pd"] is None:
                 st.info("Enter the dew point pressure under Fluid description first.")
             elif cvd_df["p"].notna().any():
                 try:
