@@ -53,11 +53,13 @@ def build_history(df, start_date, pi):
     d["w"] = pd.to_numeric(d["w"], errors="coerce").fillna(1.0) if "w" in d else 1.0
     d = d.dropna(subset=["date", "p"]).sort_values("date")
     t = (d["date"] - pd.Timestamp(start_date)).dt.total_seconds().to_numpy() / 86400.0
-    keep = (t > 0) & (d["gp"].to_numpy() > 0)
+    # Surveys before the first production are kept (zero cumulative): a reservoir that loses
+    # pressure before it is produced, for example to a neighbour, needs them.
+    keep = t > 0
     d, t = d[keep], t[keep]
     if len(d) < 3:
-        raise ValueError("At least three production history rows (after the start date, with "
-                         "pressure and cumulative gas) are needed.")
+        raise ValueError("At least three history rows after the start date, with a reservoir "
+                         "pressure, are needed.")
     z = np.zeros(1)
     return History(
         t=np.concatenate([z, t]),

@@ -43,8 +43,10 @@ aquifer detection, and is drawn hollow on the plots. Tab 6 scores the surveys so
 
 The sample case contains two deliberately bad surveys (160 and 180 psi high).
 
-7. **Relative permeability** - tank-scale Corey curves (gas-water, gas-condensate), with a fit of the water
-   curve to the produced-water history after water vapour from the gas has been set aside.
+7. **Relative permeability** - tank-scale Corey curves (gas-water, gas-condensate) and a fractional flow
+   match: measured water cut (water vapour from the gas set aside) against tank water saturation, for the
+   reservoir or for each well, with regression of any of residual gas saturation, krw, krg and the two
+   exponents. The produced condensate yield can be fitted and written to the PVT table's CGR column.
 8. **Wells** - completion data, pressure limits and well tests. Prosper lift-curve tables (.tpd) can be attached per well;
    they replace the built-in tubing calculation and add Turner liquid-loading checks. Tests may give flowing bottomhole pressure or
    tubing-head pressure (converted with the tubing calculation). A back-pressure inflow equation is fitted per well.

@@ -22,7 +22,8 @@ from mbal.pvt import (GasZ, PVT, cce_two_phase_z, condensate_props, correlation_
                       water_props, wet_gas_gravity)
 from mbal.outliers import residual_screen, runs_test, trend_screen
 from mbal.regress import leave_one_out, pressure_rms, regress
-from mbal.relperm import RelPerm, TankState, fit_water, water_history
+from mbal.relperm import (FIT_PARAMS, RelPerm, TankState, field_points, fit_fw, fit_yield, fw_model,
+                          water_history, wgr_from_fw, well_points)
 from mbal.sample import default_config, sample_case, sample_wells
 from mbal.vlp import LiftTable, read_tpd
 from mbal.wells import Well, fit_ipr, tubing_bhp, well_rate
@@ -163,6 +164,9 @@ if "vals" not in ss:
     load_blank()
 
 V = ss.vals
+for _k in TABLES:     # sessions and project files from older versions lack newer tables
+    ss.cur.setdefault(_k, empty_table(_k))
+    ss.tables.setdefault(_k, ss.cur[_k].copy())
 
 # ============================================================ sidebar
 with st.sidebar:
@@ -1576,23 +1580,7 @@ with t_rp:
         elif not np.all(np.isfinite(P_SIM)):
             st.warning("The model does not reproduce the whole history; fix the match first.")
         elif RP is not None:
-            def _fit_rp():
-                new, info = fit_water(STATE, RP, P_SIM, WE_SIM, V["rp_vap"])
-                ss.rp_fit = info
-                if info["ok"]:
-                    V.update(rp_krw=float(f"{new.krw_max:.4g}"), rp_nw=float(f"{new.nw:.4g}"))
-                    refresh()
-                    ss.rp_fit = info
-            st.button("Fit water end point and exponent to the water history", on_click=_fit_rp,
-                      type="primary")
-            info = ss.get("rp_fit")
-            if info and info["ok"]:
-                st.success(f"Fitted. Cumulative water is matched to within "
-                           f"{U.to_disp('liq_cum', info['rms'] / 1e3, SYS):,.2f} {U.label('liq_cum', SYS)}."
-                           + (" A value reached its limit, so the history only weakly fixes the "
-                              "curve." if info["at_limit"] else ""))
-            elif info:
-                st.warning(info["reason"])
+            st.caption("Fit the curves to the produced water in the fractional flow match below.")
             if not STATE.has_condensate:
                 st.caption("No retrograde liquid data (CVD panel in tab 1), so the effect of "
                            "condensate on gas flow is left out.")
@@ -1638,6 +1626,142 @@ with t_rp:
                 c[1].metric("Gas flows until water saturation", f"{1 - RP.sgrw:.0%}")
                 c[2].metric(f"Water vapour in gas now ({U.label('cgr', SYS)})",
                             f"{U.to_disp('cgr', WH['vap'][-1], SYS):.2f}")
+
+    # ---------------- fractional flow match
+    if (READY and RP is not None and STATE is not None and np.all(np.isfinite(P_SIM))):
+        st.divider()
+        st.subheader("Fractional flow match")
+        st.caption("Measured water cut against tank water saturation, with the model curve. Each "
+                   "point is the water produced over an interval divided by the gas, with the "
+                   "water that condenses from the gas taken off, converted to reservoir volumes. "
+                   "The tank water saturation comes from the history match (aquifer influx and "
+                   "rock and water expansion), so match the pressures first.")
+        by_well = V["hist_mode"] == "By well" and ss.cur["wells"].dropna(subset=["well", "date"]).shape[0] > 0
+        src_opts = {"field": "Reservoir, between pressure surveys"}
+        if by_well:
+            src_opts["wells"] = "Each well, each production record"
+        V.setdefault("ff_src", "wells" if by_well else "field")
+        if V["ff_src"] not in src_opts:
+            V["ff_src"] = "field"
+        left_f, right_f = st.columns([2, 3], gap="large")
+        with left_f:
+            choice("Points", "ff_src", src_opts)
+            if V["ff_src"] == "wells":
+                FF_PTS = well_points(STATE, P_SIM, WE_SIM, ss.cur["wells"], V["start_date"], V["rp_vap"])
+                names_ = sorted(FF_PTS["well"].unique())
+                keep_ = st.multiselect("Wells used in the fit", names_, default=names_, key=f"ffw_{KEY}")
+                FF_PTS = FF_PTS[FF_PTS["well"].isin(keep_)]
+            else:
+                FF_PTS = field_points(STATE, P_SIM, WE_SIM, V["rp_vap"])
+            ff_lab = {"rp_krw": "Water end point, krw", "rp_nw": "Water exponent",
+                      "rp_sgrw": "Residual gas saturation", "rp_ng": "Gas exponent",
+                      "rp_krg": "Gas end point, krg"}
+            V.setdefault("ff_keys", ["rp_krw", "rp_nw"])
+            ff_keys = st.multiselect("Parameters to regress", list(ff_lab), default=V["ff_keys"],
+                                     format_func=ff_lab.get, key=f"ffk_{KEY}")
+            V["ff_keys"] = ff_keys
+            n_free = int((FF_PTS["fw"] > 0).sum()) if len(FF_PTS) else 0
+            st.caption(f"{len(FF_PTS)} points, {n_free} with free water. With only a few points or "
+                       "little free water, regress one or two parameters and fix the rest.")
+
+            def _fit_ff():
+                try:
+                    new, info = fit_fw(STATE, RP, FF_PTS, ff_keys)
+                except ValueError as e:
+                    ss.ff_info = dict(ok=False, reason=str(e))
+                    return
+                if info["ok"]:
+                    V.update({k: float(f"{getattr(new, FIT_PARAMS[k][0]):.4g}") for k in ff_keys})
+                    refresh()
+                ss.ff_info = info
+            st.button("Fit the ticked parameters", type="primary", on_click=_fit_ff,
+                      disabled=not ff_keys or len(FF_PTS) == 0)
+            info = ss.get("ff_info")
+            if info and info.get("ok"):
+                st.success(f"Fitted to {info['n']} points. Water-cut mismatch "
+                           f"{info['rms0']:.2%} before, {info['rms']:.2%} after."
+                           + (" At a limit: " + ", ".join(ff_lab[k] for k in info["at_limit"])
+                              + "; the data barely constrain it." if info["at_limit"] else ""))
+            elif info:
+                st.warning(info["reason"])
+            with st.expander("Points"):
+                if len(FF_PTS):
+                    st.dataframe(pd.DataFrame({
+                        "Date": [f"{d:%d/%m/%Y}" for d in pd.Timestamp(V["start_date"]) + pd.to_timedelta(FF_PTS["t"], unit="D")],
+                        "Well": FF_PTS["well"],
+                        ulabel("Pressure", "pressure"): np.round(U.to_disp("pressure", FF_PTS["p"], SYS), 0),
+                        "Tank Sw": FF_PTS["sw"].round(4),
+                        "Water-gas ratio (STB/MMscf)": FF_PTS["wgr"].round(3),
+                        "Of which vapour": FF_PTS["vap"].round(3),
+                        "Free water cut": FF_PTS["fw"].round(5)}), hide_index=True, width="stretch", height=260)
+        with right_f:
+            if len(FF_PTS):
+                pal = [BLUE, ORANGE, AQUA, YELLOW, RED, GREY]
+                f = figure("Tank water saturation", "Reservoir water cut", height=360)
+                for i_, (nm_, g_) in enumerate(FF_PTS.groupby("well")):
+                    f.add_trace(go.Scatter(x=g_["sw"], y=g_["fw"], mode="markers", name=str(nm_),
+                                           marker=dict(color=pal[i_ % 6], size=7, opacity=0.8)))
+                sw_c = np.linspace(RP.swc, 1.0 - RP.sgrw, 120)
+                f.add_trace(go.Scatter(x=sw_c, y=fw_model(STATE, RP, np.full_like(sw_c, P_SIM[-1]), sw_c),
+                                       mode="lines", name="Model, pressure now", line=dict(color=GREY, width=2)))
+                swr = (FF_PTS["sw"].min(), FF_PTS["sw"].max())
+                pad = max(0.02, (swr[1] - swr[0]) * 0.5)
+                f.update_xaxes(range=[max(RP.swc - 0.005, swr[0] - pad), min(1 - RP.sgrw, swr[1] + pad * 3)])
+                ymax = max(float(FF_PTS["fw"].max()) * 1.5, float(fw_model(STATE, RP, P_SIM[-1], swr[1] + pad * 3)) * 1.1, 1e-3)
+                f.update_yaxes(range=[0, min(1.0, ymax)])
+                show(f, "ff")
+                dates_ = pd.Timestamp(V["start_date"]) + pd.to_timedelta(FF_PTS["t"], unit="D")
+                mod_ = wgr_from_fw(STATE, FF_PTS["p"], fw_model(STATE, RP, FF_PTS["p"], FF_PTS["sw"])) + FF_PTS["vap"]
+                f = figure("", "Water-gas ratio (STB/MMscf)", height=300)
+                for i_, (nm_, g_) in enumerate(FF_PTS.groupby("well")):
+                    idx = g_.index
+                    f.add_trace(go.Scatter(x=dates_.loc[idx], y=g_["wgr"], mode="markers",
+                                           name=f"{nm_} measured", marker=dict(color=pal[i_ % 6], size=6)))
+                    o_ = np.argsort(g_["t"].to_numpy())
+                    f.add_trace(go.Scatter(x=dates_.loc[idx].to_numpy()[o_], y=mod_.loc[idx].to_numpy()[o_],
+                                           mode="lines", name=f"{nm_} model", line=dict(color=pal[i_ % 6], width=1.5)))
+                show(f, "ff_wgr")
+                st.caption("Lines: model water-gas ratio at each point's pressure and saturation "
+                           "(free water from the curves plus water vapour).")
+
+        st.subheader("Condensate yield")
+        cy = FF_PTS.dropna(subset=["cgr"])
+        cy = cy[np.isfinite(cy["cgr"])]
+        left_c, right_c = st.columns([2, 3], gap="large")
+        with right_c:
+            if len(cy):
+                f = figure(f"Pressure ({PU})", f"Condensate yield ({U.label('cgr', SYS)})", height=320)
+                for i_, (nm_, g_) in enumerate(cy.groupby("well")):
+                    f.add_trace(go.Scatter(x=U.to_disp("pressure", g_["p"], SYS), y=U.to_disp("cgr", g_["cgr"], SYS),
+                                           mode="markers", name=str(nm_), marker=dict(color=[BLUE, ORANGE, AQUA, YELLOW, RED, GREY][i_ % 6], size=6)))
+                pp_ = np.linspace(*pvt.p_range, 80)
+                if np.nanmax(pvt.cgr_tab) > 0:
+                    f.add_trace(go.Scatter(x=U.to_disp("pressure", pp_, SYS), y=U.to_disp("cgr", pvt.cgr(pp_), SYS),
+                                           mode="lines", name="PVT table", line=dict(color=GREY, width=2)))
+                show(f, "ff_cgr")
+        with left_c:
+            st.caption("Produced condensate per MMscf of separator gas against reservoir pressure. "
+                       "While the condensate in the reservoir is below its critical saturation it "
+                       "cannot flow, so the yield follows the PVT table's CGR column, which is what "
+                       "the forecast uses.")
+            fy = fit_yield(cy) if len(cy) else None
+            if fy is None:
+                st.info("Not enough points over a wide enough pressure range to fit the yield.")
+            else:
+                a_, b_, plo_, phi_ = fy
+                st.write(f"Straight-line fit: {U.to_disp('cgr', b_ + a_ * phi_, SYS):.1f} at "
+                         f"{U.to_disp('pressure', phi_, SYS):,.0f} {PU} to {U.to_disp('cgr', b_ + a_ * plo_, SYS):.1f} at "
+                         f"{U.to_disp('pressure', plo_, SYS):,.0f} {PU} ({U.label('cgr', SYS)}).")
+
+                def _set_cgr():
+                    sync_tables()
+                    t_ = ss.cur["pvt"].copy()
+                    pc = pd.to_numeric(t_["p"], errors="coerce").clip(plo_, phi_)
+                    t_["cgr"] = np.maximum(b_ + a_ * pc, 0.0)
+                    ss.cur["pvt"] = t_
+                    refresh()
+                st.button("Set the PVT table's CGR column from this fit", on_click=_set_cgr,
+                          help="Outside the produced pressure range the yield is held at the end values.")
 
 # ============================================================ 8. Wells
 WELLS, GZ, WELL_ERR = [], None, None

@@ -403,6 +403,28 @@ def test_cce_two_phase_z():
     assert any("not 1" in m for m in bad)
 
 
+
+def test_fractional_flow_match():
+    from mbal.relperm import RelPerm, field_points, fit_fw, fw_model, water_history, wgr_from_fw, fit_yield
+    c, pvt, h, tank, p, we, rp, state, *_ = _sample_forecast_setup()
+    true = RelPerm(swc=c["swi"], krw_max=0.12, nw=2.2, sgrw=0.3)
+    for _ in range(6):
+        h.wp[:] = water_history(state, true, p, we)["wp"]
+    pts = field_points(state, p, we)
+    assert len(pts) == len(h.t) - 1 and (pts.fw > 0).sum() > 5
+    # water cut and water-gas ratio convert back and forth
+    assert np.allclose(wgr_from_fw(state, pts.p, pts.fw), pts.free, rtol=1e-6)
+    new, info = fit_fw(state, rp, pts, ["rp_krw", "rp_nw", "rp_sgrw"])
+    assert info["ok"] and info["rms"] < 1e-4
+    assert abs(new.krw_max / 0.12 - 1) < 0.05 and abs(new.nw - 2.2) < 0.1 and abs(new.sgrw - 0.3) < 0.01
+    # no free water: refuses
+    h.wp[:] = water_history(state, true, p, we)["wp_vap"]
+    assert not fit_fw(state, rp, field_points(state, p, we), ["rp_krw"])[1]["ok"]
+    # yield: a straight line through the produced condensate-gas ratio
+    fy = fit_yield(pts)
+    assert fy is not None and fy[2] < fy[3]
+
+
 if __name__ == "__main__":
     for k, v in list(globals().items()):
         if k.startswith("test_"):
