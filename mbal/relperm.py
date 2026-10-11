@@ -77,7 +77,8 @@ class TankState:
         t = self.tank
         dp = t.pi - np.asarray(p, float)
         pv = self.pvi * (1.0 - t.cf * dp)
-        return (self.pvi * t.swi * (1.0 + t.cw * dp) + we - wp * t.bw) / pv
+        wi = t.h.wi[-1] if np.ndim(wp) == 0 else (t.h.wi if np.shape(wp) == np.shape(t.h.wi) else 0.0)
+        return (self.pvi * t.swi * (1.0 + t.cw * dp) + we - (wp - wi) * t.bw) / pv
 
     def so(self, p):
         if self.sl is None:

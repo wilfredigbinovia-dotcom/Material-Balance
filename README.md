@@ -1,6 +1,8 @@
-# Condensate MBAL
+# Material balance
 
-Material balance tool for retrograde gas-condensate reservoirs (oil and dry-gas modules to follow).
+Material balance tool for retrograde gas-condensate reservoirs and black-oil reservoirs. Choose the
+fluid at the top of the sidebar; the two share the production history, aquifer models, regression,
+units and project files.
 
 ## Run
 
@@ -105,6 +107,37 @@ G is the wet (well-stream) gas initially in place.
 * Not modelled: liquid loading in the tubing for wells without lift curves, near-well condensate banking beyond the tank-average
   saturation, coning, and differences in water arrival between wells.
 
+## Oil reservoirs
+
+    F   = Np Bo + (Gp - Np Rs) Bg + Wp Bw
+    Eo  = (Bo - Boi) + (Rsi - Rs) Bg
+    Eg  = Boi (Bg / Bgi - 1)
+    Efw = (1 + m) Boi (cw Swi + cf) / (1 - Swi) (pi - p)
+    F   = N (Eo + m Eg + Efw) + We
+
+* PVT: a black-oil table (Bo, Rs, Bg, oil and gas viscosity) from correlations (Standing,
+  Vasquez-Beggs, Beggs-Robinson, DAK, Lee-Gonzalez-Eakin), from a differential liberation corrected to
+  separator conditions (Bo = Bod Bofb/Bodb, Rs = Rsfb - (Rsdb - Rsd) Bofb/Bodb) with CCE relative volumes
+  above the bubble point, or pasted from another program.
+* Diagnostics: F against Et, Campbell, Havlena-Odeh with aquifer, gas cap plot (F - We)/Eo against Eg/Eo,
+  drive indices; regression of N, m, cf and aquifer parameters.
+* Tank saturations: Sw from water balance, So = (N - Np) Bo / PV, Sg = 1 - So - Sw. Corey oil-water and
+  gas-oil curves (kro as the normalised product); producing GOR = Rs + (krg/mug Bg)/(kro/muo Bo);
+  fractional flow match of GOR and water cut.
+* Wells: liquid productivity index fitted to tests, straight-line inflow above the bubble point and
+  Vogel below. Tubing: Prosper oil lift curves (.tpd with liquid or oil rate, water cut, GOR, THP) or the
+  built-in Beggs and Brill (1973, Payne correction) marched through the black-oil table and tabulated
+  once per completion.
+* Per-well curves: the gas and water curves can be fitted to each well's own GOR and water cut, so each
+  well gets its own GOR, water cut and productivity decline from the tank saturations.
+* Injection: cumulative water and gas injected (history, both fluids) are taken off the withdrawal; the
+  oil forecast takes a water injection rate or voidage replacement ratio and a gas injection rate.
+* Neighbouring reservoir: fluid crosses at T (p_neighbour - p) rb/day, counted as water; in the forecast
+  it depletes as a closed volume with compressibility cw + cf, stops, or holds its last pressure.
+* Survey screening (trend and model) as on the gas side; the Campbell drive test uses only surveys below
+  the bubble point when there are enough of them.
+* Forecast: field oil target, minimum rate, maximum water cut and GOR.
+
 ## Files
 
     app.py            Streamlit interface
@@ -118,6 +151,10 @@ G is the wet (well-stream) gas initially in place.
     mbal/wells.py     tubing pressure drop and inflow fit
     mbal/vlp.py       Prosper .tpd lift-curve reader and interpolation
     mbal/forecast.py  forecast stepping
+    mbal/oil.py       black-oil PVT, tank, saturations, rel perm, wells, forecast
+    mbal/oil_sample.py synthetic oil case
+    mbal/multiphase.py Beggs and Brill tubing for oil wells
+    oil_page.py       oil pages of the app
     mbal/model.py     configuration -> engine objects
     mbal/sample.py    synthetic sample case
     tests/            engine checks:  python tests/test_engine.py

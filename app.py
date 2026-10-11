@@ -28,7 +28,7 @@ from mbal.sample import default_config, sample_case, sample_wells
 from mbal.vlp import LiftTable, read_tpd
 from mbal.wells import Well, fit_ipr, tubing_bhp, well_rate
 
-st.set_page_config(page_title="Condensate Material Balance", page_icon="🛢️", layout="wide")
+st.set_page_config(page_title="Material Balance", page_icon="🛢️", layout="wide")
 ss = st.session_state
 
 # Number boxes: no -/+ step buttons (values are typed in).
@@ -53,9 +53,13 @@ TABLES = {  # name -> [(column, label, quantity or None)]
             ("zg", "Gas Z-factor (single phase)", None)],
     "hist": [("date", "Date", "date"), ("p", "Reservoir pressure", "pressure"),
              ("gp", "Cum. gas", "gas_cum"), ("np", "Cum. condensate", "liq_cum"),
-             ("wp", "Cum. water", "liq_cum")] + SURVEY,
+             ("wp", "Cum. water", "liq_cum"),
+             ("wi", "Cum. water injected (optional)", "liq_cum"),
+             ("gi", "Cum. gas injected (optional)", "gas_cum")] + SURVEY,
     "wells": [("well", "Well", "text"), ("date", "Date", "date"), ("gp", "Cum. gas", "gas_cum"),
-              ("np", "Cum. condensate", "liq_cum"), ("wp", "Cum. water", "liq_cum")],
+              ("np", "Cum. condensate", "liq_cum"), ("wp", "Cum. water", "liq_cum"),
+              ("wi", "Cum. water injected (optional)", "liq_cum"),
+              ("gi", "Cum. gas injected (optional)", "gas_cum")],
     "pres": [("date", "Date", "date"), ("p", "Reservoir pressure", "pressure")] + SURVEY,
     "nbr": [("date", "Date", "date"), ("p", "Neighbour static pressure", "pressure")],
     "wellcfg": [("well", "Well", "text"), ("tvd", "Depth to perforations, TVD", "length"),
@@ -69,6 +73,22 @@ TABLES = {  # name -> [(column, label, quantity or None)]
               ("pth", "Flowing tubing-head pressure", "pressure"),
               ("pr", "Reservoir pressure (optional)", "pressure"),
               ("wgr", "Water-gas ratio (optional)", "cgr")],
+    # ---- oil
+    "opvt": [("p", "Pressure", "pressure"), ("bo", "Bo", "fvf_o"), ("rs", "Rs", "gor"),
+             ("bg", "Bg", "bg_o"), ("muo", "Oil viscosity", "visc"), ("mug", "Gas viscosity", "visc")],
+    "odl": [("p", "Pressure", "pressure"), ("bod", "Bod", "fvf_o"), ("rsd", "Rsd", "gor"),
+            ("bg", "Bg (optional)", "bg_o"), ("muo", "Oil viscosity (optional)", "visc")],
+    "occe": [("p", "Pressure", "pressure"), ("vr", "Relative volume V/Vb", None)],
+    "owellcfg": [("well", "Well", "text"), ("tvd", "Depth to perforations, TVD", "length"),
+                 ("md", "Measured depth (optional)", "length"), ("tid", "Tubing inner diameter", "diam"),
+                 ("wht", "Flowing wellhead temperature", "temperature"),
+                 ("min_thp", "Minimum tubing-head pressure", "pressure"),
+                 ("min_bhp", "Minimum bottomhole pressure", "pressure"),
+                 ("qmax", "Maximum liquid rate (optional)", "liq_rate")],
+    "otests": [("well", "Well", "text"), ("date", "Date", "date"), ("ql", "Liquid rate", "liq_rate"),
+               ("pwf", "Flowing bottomhole pressure", "pressure"),
+               ("pth", "Flowing tubing-head pressure", "pressure"),
+               ("pr", "Reservoir pressure (optional)", "pressure")],
 }
 
 
@@ -94,6 +114,19 @@ def refresh():
 
 
 def load_sample():
+    if ss.get("vals", {}).get("fluid") == "oil":
+        from mbal.oil_sample import oil_sample_case
+        oc, otab, pb, hist, wells, pres, tests, wcfg, start = oil_sample_case()
+        c = blank_config()
+        c.update(oc, o_pb=round(pb, 1), fluid="oil", start_date=start, hist_mode="By reservoir",
+                 aq_model="veh", aq_geom="radial", aq_inf=False, aq_ro=4000.0, aq_reD=3.0, aq_h=60.0,
+                 aq_theta=180.0, aq_k=50.0, aq_phi=0.2)
+        ss.vals = c
+        ss.cur = {k: empty_table(k) for k in TABLES}
+        ss.cur.update(opvt=otab, hist=hist, wells=wells, pres=pres, otests=tests, owellcfg=wcfg)
+        ss.ver = ss.get("ver", 0)
+        refresh()
+        return
     c, tab, hist, wells, pres, start = sample_case()
     c.update(start_date=start, hist_mode="By reservoir")
     ss.vals = c
@@ -130,7 +163,9 @@ LABELS = {}     # key -> label, filled as the number boxes are drawn
 
 
 def load_blank():
+    fluid = ss.get("vals", {}).get("fluid", "gas")
     ss.vals = blank_config()
+    ss.vals["fluid"] = fluid
     ss.cur = {k: empty_table(k) for k in TABLES}
     refresh()
 
@@ -169,9 +204,25 @@ for _k in TABLES:     # sessions and project files from older versions lack newe
     ss.tables.setdefault(_k, ss.cur[_k].copy())
 
 # ============================================================ sidebar
+V.setdefault("fluid", "gas")
+
+
+def _set_fluid():
+    new = "oil" if ss["fluid_radio"] == "Oil" else "gas"
+    if new != V.get("fluid"):
+        sync_tables()
+        V["fluid"] = new
+        refresh()
+
+
 with st.sidebar:
-    st.title("Condensate MBAL")
-    st.caption("Material balance for retrograde gas-condensate reservoirs")
+    st.title("Material Balance")
+    ss["fluid_radio"] = "Oil" if V["fluid"] == "oil" else "Gas condensate"   # follows opened projects
+    st.selectbox("Fluid type", ["Gas condensate", "Oil"], key="fluid_radio", on_change=_set_fluid,
+             help="Both share the production history, aquifer and regression tools. Load the "
+                  "sample case or start blank after switching.")
+    st.caption("Retrograde gas-condensate reservoirs" if V["fluid"] == "gas" else
+               "Black-oil reservoirs, with or without a gas cap")
     unit_choice = st.radio("Units", ["Field", "SI"], horizontal=True, key="unit_radio",
                            on_change=sync_tables)
     SYS = "field" if unit_choice == "Field" else "si"
@@ -190,9 +241,11 @@ with st.sidebar:
         except Exception as e:  # noqa: BLE001
             st.error(f"Could not read that project file: {e}")
     st.divider()
-    st.caption("Work through the tabs from left to right. The app starts empty; the sample "
-               "case is synthetic: 250 Bscf wet gas with a finite radial aquifer, and two deliberately bad "
-               "pressure surveys to try the screening on.")
+    st.caption("Work through the tabs from left to right. The app starts empty. "
+               + ("The sample case is synthetic: 250 Bscf wet gas with a finite radial aquifer, and "
+                  "two deliberately bad pressure surveys to try the screening on." if V["fluid"] == "gas" else
+                  "The sample case is synthetic: 60 MMSTB of undersaturated oil that falls below its "
+                  "bubble point, with a radial aquifer and three wells."))
 
 KEY = f"{SYS}_{ss.ver}"
 
@@ -206,7 +259,7 @@ def ulabel(text, q):
 
 def num(label, key, q=None, where=st, step=None, minv=None, maxv=None, fmt="%.6g", help=None):
     LABELS[key] = label
-    disp = None if V[key] is None else float(U.to_disp(q, V[key], SYS))
+    disp = None if V.get(key) is None else float(U.to_disp(q, V[key], SYS))
     kw = {}
     if minv is not None:
         kw["min_value"] = float(U.to_disp(q, minv, SYS))
@@ -392,6 +445,70 @@ def fmt_g(scf):
 
 PU, GU = U.label("pressure", SYS), U.label("gas_ip", SYS)
 
+
+def aquifer_inputs(cw_key="cw", cf_key="cf", muw_key="aq_muw"):
+    """Aquifer model / geometry / parameter widgets."""
+    c = st.columns(2, vertical_alignment="bottom")
+    m = choice("Aquifer model (method)", "aq_model", MODELS, c[0])
+    if m in NEEDS_GEOMETRY:
+        g = choice("Aquifer system (geometry)", "aq_geom", GEOMETRIES, c[1])
+    else:
+        g = V["aq_geom"]
+    if m == "none":
+        st.caption("No aquifer: the tank is treated as volumetric.")
+        return
+    if m == "pot":
+        num("Aquifer water volume", "aq_Wvol", "res_vol", step=50.0, minv=0.001,
+            help="We = (cw + cf) · W · (pi − p). Instant response; suits small aquifers.")
+        return
+    if m == "schilthuis":
+        num("Aquifer constant", "aq_C", "aq_const", step=5.0, minv=0.001,
+            help="dWe/dt = C · (pi − p). Constant-pressure outer boundary.")
+        return
+    c = st.columns(3, vertical_alignment="bottom")
+    if g == "radial":
+        num("Reservoir radius", "aq_ro", "length", c[0], step=250.0, minv=10.0)
+        inf_ok = m != "fetkovich"
+        if inf_ok:
+            V["aq_inf"] = c[1].checkbox("Infinite-acting aquifer", value=bool(V["aq_inf"]),
+                                        key=f"cb_inf_{KEY}")
+        if not (inf_ok and V["aq_inf"]):
+            num("Outer/inner radius ratio (re/ro)", "aq_reD", "ratio", c[1], step=0.5, minv=1.05)
+        num("Encroachment angle", "aq_theta", "angle", c[2], step=10.0, minv=1.0, maxv=360.0)
+        c = st.columns(3, vertical_alignment="bottom")
+        num("Aquifer thickness", "aq_h", "length", c[0], step=5.0, minv=0.5)
+    elif g == "linear":
+        num("Aquifer width", "aq_width", "length", c[0], step=250.0, minv=10.0)
+        num("Aquifer length", "aq_L", "length", c[1], step=1000.0, minv=10.0)
+        num("Aquifer thickness", "aq_h", "length", c[2], step=5.0, minv=0.5)
+        c = st.columns(3, vertical_alignment="bottom")
+    else:
+        num("Reservoir radius", "aq_ro", "length", c[0], step=250.0, minv=10.0)
+        num("Aquifer thickness (below contact)", "aq_h", "length", c[1], step=5.0, minv=0.5)
+        num("Vertical anisotropy kv/kh", "aq_kvkh", "ratio", c[2], step=0.05, minv=1e-5, maxv=1.0)
+        c = st.columns(3, vertical_alignment="bottom")
+        num("Encroachment angle", "aq_theta", "angle", c[0], step=10.0, minv=1.0, maxv=360.0,
+            help="360° when water underlies the whole reservoir.")
+    num("Aquifer permeability", "aq_k", "perm", c[1], step=10.0, minv=0.001)
+    num("Aquifer porosity", "aq_phi", "frac", c[2], step=0.01, minv=0.01, maxv=0.6)
+    st.caption("Aquifer total compressibility = cw + cf = "
+               + (f"{U.to_disp('compress', V[cw_key] + V[cf_key], SYS):.2f} {U.label('compress', SYS)}; "
+                  if V.get(cw_key) is not None and V.get(cf_key) is not None else "not yet entered; ")
+               + "water viscosity " + ("not entered" if V.get(muw_key) is None else f"{V[muw_key]:.3g} cp")
+               + " (tab 3)."
+               + (" Bottom drive is modelled as vertical linear flow through the reservoir area."
+                  if g == "bottom" else ""))
+
+
+_liq = "Cum. oil" if V.get("fluid") == "oil" else "Cum. condensate"
+for _n in ("hist", "wells"):
+    TABLES[_n] = [(c_, (_liq if c_ == "np" else l_), q_) for c_, l_, q_ in TABLES[_n]]
+
+if V.get("fluid") == "oil":
+    import oil_page
+    oil_page.render(globals())
+    st.stop()
+
 t_pvt, t_prod, t_res, t_hm, t_aq, t_reg, t_rp, t_wl, t_fc = st.tabs(
     ["1 · PVT", "2 · Production", "3 · Reservoir",
      "4 · History match", "5 · Aquifer", "6 · Regression",
@@ -569,7 +686,8 @@ with t_prod:
         mode = choice("Enter production", "hist_mode",
                       {"By reservoir": "By reservoir", "By well": "By well"}, horizontal=True)
     st.caption("All volumes are cumulative. Gas is separator (dry) gas; the tool converts "
-               "condensate to its gas equivalent to obtain wet-gas production. Untick **Use** to "
+               "condensate to its gas equivalent to obtain wet-gas production. Injected water and gas "
+               "(optional) are taken off the withdrawal; injection is not continued in the forecast. Untick **Use** to "
                "switch a pressure survey off; tab 6 can suggest which ones to review.")
     with st.expander("Import a production and pressure workbook (Excel or CSV)"):
         st.caption("One sheet with Date and cumulative Gas, Condensate and Water, and one with Date "
@@ -814,59 +932,6 @@ def detection_banner(short=False):
             st.info(f"**No additional energy source detected**, but an aquifer model is active. {msg}")
     else:
         st.info(msg)
-
-
-def aquifer_inputs():
-    """Aquifer model / geometry / parameter widgets."""
-    c = st.columns(2, vertical_alignment="bottom")
-    m = choice("Aquifer model (method)", "aq_model", MODELS, c[0])
-    if m in NEEDS_GEOMETRY:
-        g = choice("Aquifer system (geometry)", "aq_geom", GEOMETRIES, c[1])
-    else:
-        g = V["aq_geom"]
-    if m == "none":
-        st.caption("No aquifer: the tank is treated as volumetric.")
-        return
-    if m == "pot":
-        num("Aquifer water volume", "aq_Wvol", "res_vol", step=50.0, minv=0.001,
-            help="We = (cw + cf) · W · (pi − p). Instant response; suits small aquifers.")
-        return
-    if m == "schilthuis":
-        num("Aquifer constant", "aq_C", "aq_const", step=5.0, minv=0.001,
-            help="dWe/dt = C · (pi − p). Constant-pressure outer boundary.")
-        return
-    c = st.columns(3, vertical_alignment="bottom")
-    if g == "radial":
-        num("Reservoir radius", "aq_ro", "length", c[0], step=250.0, minv=10.0)
-        inf_ok = m != "fetkovich"
-        if inf_ok:
-            V["aq_inf"] = c[1].checkbox("Infinite-acting aquifer", value=bool(V["aq_inf"]),
-                                        key=f"cb_inf_{KEY}")
-        if not (inf_ok and V["aq_inf"]):
-            num("Outer/inner radius ratio (re/ro)", "aq_reD", "ratio", c[1], step=0.5, minv=1.05)
-        num("Encroachment angle", "aq_theta", "angle", c[2], step=10.0, minv=1.0, maxv=360.0)
-        c = st.columns(3, vertical_alignment="bottom")
-        num("Aquifer thickness", "aq_h", "length", c[0], step=5.0, minv=0.5)
-    elif g == "linear":
-        num("Aquifer width", "aq_width", "length", c[0], step=250.0, minv=10.0)
-        num("Aquifer length", "aq_L", "length", c[1], step=1000.0, minv=10.0)
-        num("Aquifer thickness", "aq_h", "length", c[2], step=5.0, minv=0.5)
-        c = st.columns(3, vertical_alignment="bottom")
-    else:
-        num("Reservoir radius", "aq_ro", "length", c[0], step=250.0, minv=10.0)
-        num("Aquifer thickness (below contact)", "aq_h", "length", c[1], step=5.0, minv=0.5)
-        num("Vertical anisotropy kv/kh", "aq_kvkh", "ratio", c[2], step=0.05, minv=1e-5, maxv=1.0)
-        c = st.columns(3, vertical_alignment="bottom")
-        num("Encroachment angle", "aq_theta", "angle", c[0], step=10.0, minv=1.0, maxv=360.0,
-            help="360° when water underlies the whole reservoir.")
-    num("Aquifer permeability", "aq_k", "perm", c[1], step=10.0, minv=0.001)
-    num("Aquifer porosity", "aq_phi", "frac", c[2], step=0.01, minv=0.01, maxv=0.6)
-    st.caption(f"Aquifer total compressibility = cw + cf = "
-               f"{U.to_disp('compress', V['cw'] + V['cf'], SYS):.2f} {U.label('compress', SYS)}; "
-               "water viscosity " + ("not entered" if V["aq_muw"] is None else f"{V['aq_muw']:.3g} cp")
-               + " (tab 3)."
-               + (" Bottom drive is modelled as vertical linear flow through the reservoir area."
-                  if g == "bottom" else ""))
 
 
 # The aquifer tab is rendered before the history-match tab is computed so that both use

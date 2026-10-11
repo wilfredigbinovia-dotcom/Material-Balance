@@ -25,6 +25,12 @@ Q = {
     "liq_rate":    {"field": ("STB/d", 1.0, 0.0),           "si": ("sm³/d", 0.158987, 0.0)},
     "diam":        {"field": ("in", 1.0, 0.0),              "si": ("mm", 25.4, 0.0)},
     "transmiss":   {"field": ("Mscf/d/psi", 1.0, 0.0),      "si": ("10³ sm³/d/bar", 0.0283168 * 14.5038, 0.0)},
+    "oil_ip":      {"field": ("MMSTB", 1.0, 0.0),           "si": ("10⁶ sm³", 0.158987, 0.0)},
+    "gor":         {"field": ("scf/STB", 1.0, 0.0),         "si": ("sm³/sm³", 0.178108, 0.0)},
+    "fvf_o":       {"field": ("rb/STB", 1.0, 0.0),          "si": ("rm³/sm³", 1.0, 0.0)},
+    "bg_o":        {"field": ("rb/Mscf", 1.0, 0.0),         "si": ("rm³/10³ sm³", 5.61458, 0.0)},
+    "pi_liq":      {"field": ("STB/d/psi", 1.0, 0.0),       "si": ("sm³/d/bar", 0.158987 * 14.5038, 0.0)},
+    "transmiss_res": {"field": ("rb/d/psi", 1.0, 0.0),      "si": ("rm³/d/bar", 0.158987 * 14.5038, 0.0)},
     "pz":          {"field": ("psia", 1.0, 0.0),            "si": ("bara", 0.0689476, 0.0)},
 }
 

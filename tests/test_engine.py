@@ -425,6 +425,168 @@ def test_fractional_flow_match():
     assert fy is not None and fy[2] < fy[3]
 
 
+
+def _oil_volumetric():
+    from mbal.matbal import History
+    from mbal.oil import OilPVT, OilRelPerm, OilState, OilTank, OilWell, correlation_table, oil_forecast
+    tab, pb = correlation_table(32, 0.75, 650, 200, 5000)
+    pvt = OilPVT(tab, pb, 200.0)
+    h0 = History(np.array([0.0]), np.array([4200.0]), np.zeros(1), np.zeros(1), np.zeros(1))
+    tank = OilTank(pvt, h0, 50e6, 0.0, 4200.0, 0.2, 4e-6, 3e-6, 1.02)
+    rp = OilRelPerm(swc=0.2)
+    st = OilState(tank, 0.35)
+    df, s = oil_forecast(tank, np.array([4200.0]), np.zeros(1), [OilWell("w", J=8.0, min_bhp=1000.0)],
+                         rp, st, 8 * 365.25, q_target=8000.0)
+    return pvt, tank, rp, st, df, s
+
+
+def test_oil_pvt_and_material_balance():
+    import pandas as pd
+    from mbal.matbal import History
+    from mbal.oil import OilTank, oil_graphical, lab_table, standing_pb, standing_rs
+    # Standing bubble point and Rs agree with each other
+    pb = standing_pb(650, 32, 0.75, 200)
+    assert abs(standing_rs(pb, 32, 0.75, 200) - 650) < 0.5
+    # differential liberation corrected to separator conditions (McCain)
+    dl = pd.DataFrame({"p": [1000, 2000, 3000], "bod": [1.20, 1.30, 1.40], "rsd": [300, 500, 700]})
+    tab, notes = lab_table(dl, 3000, 1.35, 600, cce=pd.DataFrame({"p": [3500, 4000], "vr": [0.99, 0.98]}))
+    r = tab.set_index("p")
+    assert abs(r.loc[3000, "bo"] - 1.35) < 1e-9 and abs(r.loc[3000, "rs"] - 600) < 1e-9
+    assert abs(r.loc[1000, "bo"] - 1.20 * 1.35 / 1.40) < 1e-9
+    assert abs(r.loc[1000, "rs"] - (600 - 400 * 1.35 / 1.40)) < 1e-9
+    assert abs(r.loc[4000, "bo"] - 1.35 * 0.98) < 1e-9 and r.loc[4000, "rs"] == 600
+    assert r["bg"].notna().all() and r["muo"].notna().all()
+    # the forecast honours the material balance, and the tank reproduces its own history
+    pvt, tank, rp, st, df, s = _oil_volumetric()
+    i = len(df) - 1
+    assert abs(tank.balance(df.p[i], 0.0, df.np[i], df.gp[i], df.wp[i])) / (tank.N * tank.Et(df.p[i])) < 1e-4
+    assert df.p.min() < pvt.pb < df.p.max()          # crosses the bubble point
+    k = slice(0, len(df), 6)
+    h = History(df.t.to_numpy()[k], df.p.to_numpy()[k], df.gp.to_numpy()[k], df.np.to_numpy()[k], df.wp.to_numpy()[k])
+    t2 = OilTank(pvt, h, tank.N, 0.0, 4200.0, 0.2, 4e-6, 3e-6, 1.02)
+    assert np.nanmax(np.abs(t2.simulate()[0] - h.p)) < 0.5
+    # F against Et through the origin gives N; the Campbell plot is flat
+    g = oil_graphical(t2, "F against Et (volumetric)")
+    assert abs(g["N"] / tank.N - 1) < 1e-3
+    c = oil_graphical(t2, "Campbell: F/Et against Np")
+    yy = c["y"][1:]
+    assert np.ptp(yy[np.isfinite(yy)]) / tank.N < 1e-3
+    # above the bubble point there is no free gas in the tank
+    sw, so, sg = st.sats(df.p.to_numpy(), df.we.to_numpy(), df.np.to_numpy(), df.wp.to_numpy())
+    above = df.p.to_numpy() > pvt.pb + 1
+    assert np.all(sg[above] < 1e-4) and np.all(sg[~above][-3:] > 0.01)
+    assert s["rf"] > s["rf_hist"] and s["rf"] < 0.5
+
+
+def test_oil_regression_and_wells():
+    from mbal.matbal import History
+    from mbal.oil import OilTank, OilRelPerm, fit_oil_ratios, oil_points, fit_pi, ipr_shape, oil_well_rate, OilWell
+    from mbal.regress import regress
+    pvt, tank, rp, st, df, s = _oil_volumetric()
+    k = slice(0, len(df), 6)
+    h = History(df.t.to_numpy()[k], df.p.to_numpy()[k], df.gp.to_numpy()[k], df.np.to_numpy()[k], df.wp.to_numpy()[k])
+    sim = lambda x: OilTank(pvt, h, x[0] * 1e6, 0.0, 4200.0, 0.2, 4e-6, 3e-6, 1.02).simulate()[0]  # noqa: E731
+    r = regress(sim, h.p, [80.0], [5.0], [500.0])
+    assert abs(r["x"][0] / 50.0 - 1) < 0.005
+    # GOR fit recovers the gas curve that generated the history
+    t2 = OilTank(pvt, h, tank.N, 0.0, 4200.0, 0.2, 4e-6, 3e-6, 1.02)
+    from mbal.oil import OilState
+    st2 = OilState(t2, 0.35)
+    pts = oil_points(st2, rp, t2.simulate()[0], np.zeros(len(h.t)))
+    start = OilRelPerm(swc=0.2, krg_max=0.3, ng=3.5)
+    new, info = fit_oil_ratios(st2, start, pts, ["o_krg", "o_ng"], "gas")
+    assert info["ok"] and info["rms"] < 0.05 * info["rms0"] + 1.0
+    # productivity index from tests, composite inflow above and below the bubble point
+    J = 5.0
+    pr, pwf = [4200.0, 2500.0], [3000.0, 1500.0]
+    q = [J * float(ipr_shape(a, b, pvt.pb)) for a, b in zip(pr, pwf)]
+    Jf, _ = fit_pi(q, pr, pwf, pvt.pb, [1.0, 1.0])
+    assert abs(Jf - J) < 1e-9
+    assert abs(float(ipr_shape(4200.0, 3500.0, 3000.0)) - 700.0) < 1e-9
+    w = OilWell("w", J=J, min_bhp=2000.0)
+    assert abs(oil_well_rate(w, 4200.0, 1.0, pvt.pb, 0.0, 650.0)[0] - J * float(ipr_shape(4200, 2000, pvt.pb))) < 1e-9
+
+
+def test_oil_lift_table():
+    from mbal.vlp import read_tpd_oil
+    q = np.geomspace(100, 20000, 12)
+    thp, wc, gor = [100.0, 500.0, 900.0], [0.0, 50.0, 90.0], [300.0, 1000.0, 5000.0]
+    fun = lambda a, d, c, b: a + 2500.0 * (1 + c / 200.0) * (1 - 0.1 * np.log10(b / 300.0)) + 0.02 * d   # noqa: E731
+    out = ["# Rate Variable =  4000 - Liquid Rate", "# Variable 3 =  21 - Water Cut",
+           "# Variable 2 =  14 - Gas Oil Ratio", "# Variable 1 =  27 - Top Node Pressure",
+           "TPDData", "2", "0,0,2,0", "0,0", "32,0.75,3.4e+35,3.4e+35,30,9000", "3",
+           "12, 3, 3, 3", "1", "5000", "4000,21,14,27"]
+    j = lambda v: ", ".join(f"{x:.6g}" for x in v)     # noqa: E731
+    out += [j(q), j(wc), j(gor), j(np.array(thp) - 14.696)]
+    for a in thp:
+        for b in gor:
+            for c in wc:
+                for d in q:
+                    out.append(f"{fun(a, d, c, b) - 14.696:.4f}")
+    t = read_tpd_oil("\n".join(out), "o.tpd")
+    assert t.rate_kind == "liquid" and t.bhp.shape == (3, 3, 3, 12)
+    assert abs(t.bhp_at(500.0, q[5], 50.0, 1000.0) - fun(500.0, q[5], 50.0, 1000.0)) < 0.01
+    assert abs(t.bhp_at(700.0, q[5], 50.0, 1000.0) - fun(700.0, q[5], 50.0, 1000.0)) < 0.01   # linear in THP
+
+
+
+def test_oil_injection_neighbour_and_tubing():
+    from dataclasses import replace as dc_replace
+    from mbal.matbal import History
+    from mbal.oil import OilTank, OilState, OilWell, oil_forecast
+    from mbal.multiphase import bb_bhp, bb_lift_table
+    pvt, tank, rp, st, df, s = _oil_volumetric()
+    k = slice(0, len(df), 6)
+    h = History(df.t.to_numpy()[k], df.p.to_numpy()[k], df.gp.to_numpy()[k], df.np.to_numpy()[k], df.wp.to_numpy()[k])
+    t2 = OilTank(pvt, h, tank.N, 0.0, 4200.0, 0.2, 4e-6, 3e-6, 1.02)
+    p2, we2 = t2.simulate()
+    st2 = OilState(t2, 0.35)
+    wells = [OilWell("w", J=8.0, min_bhp=1000.0)]
+    base, sb = oil_forecast(t2, p2, we2, wells, rp, st2, 10 * 365.25)
+    # full voidage replacement holds the pressure; more oil is recovered
+    vr, sv = oil_forecast(t2, p2, we2, wells, rp, st2, 10 * 365.25, vrr=1.0)
+    f = vr[vr.forecast]
+    assert np.ptp(f.p.to_numpy()[2:]) < 0.2 * np.ptp(base[base.forecast].p.to_numpy())
+    assert sv["np_end"] > sb["np_end"] and sv["wi_end"] > 0
+    i = len(vr) - 1
+    lhs = t2.N * t2.Et(vr.p[i])
+    assert abs(lhs - t2.F(vr.p[i], vr.np[i], vr.gp[i], vr.wp[i], vr.wi[i], vr.gi[i])) / lhs < 1e-3
+    # injected water raises the tank water saturation
+    assert f.sw.iloc[-1] > base[base.forecast].sw.iloc[-1] + 0.01
+    # history with injection: the tank reproduces its own pressures
+    hi = History(vr.t.to_numpy()[::6], vr.p.to_numpy()[::6], vr.gp.to_numpy()[::6], vr.np.to_numpy()[::6],
+                 vr.wp.to_numpy()[::6], wi=vr.wi.to_numpy()[::6], gi=vr.gi.to_numpy()[::6])
+    t3 = OilTank(pvt, hi, tank.N, 0.0, 4200.0, 0.2, 4e-6, 3e-6, 1.02)
+    assert np.nanmax(np.abs(t3.simulate()[0] - hi.p)) < 5.0
+    # neighbour: a finite volume gives less support than one held at constant pressure
+    nb = (h.t, np.full(len(h.t), 3500.0), 50.0)
+    t4 = OilTank(pvt, h, tank.N, 0.0, 4200.0, 0.2, 4e-6, 3e-6, 1.02, neighbour=nb)
+    p4, we4 = t4.simulate()
+    assert np.all(p4[2:] > p2[2:])
+    st4 = OilState(t4, 0.35)
+    dc, sc = oil_forecast(t4, p4, we4, wells, rp, st4, 10 * 365.25, nb_mode="constant")
+    dd, sd = oil_forecast(t4, p4, we4, wells, rp, st4, 10 * 365.25, nb_mode="deplete", nb_vol=50e6)
+    dx, sx = oil_forecast(t4, p4, we4, wells, rp, st4, 10 * 365.25, nb_mode="cutoff")
+    assert sx["np_end"] < sd["np_end"] < sc["np_end"]
+    assert np.all(np.diff(dd[dd.forecast].pn.to_numpy()) <= 1e-6)
+    # per-well curves: a well with an earlier, stronger water curve makes more water
+    wet = dc_replace(rp, krw_max=0.9, nw=1.5, sorw=0.1)
+    two = [OilWell("a", J=4.0, min_bhp=1000.0), OilWell("b", J=4.0, min_bhp=1000.0)]
+    d2, _ = oil_forecast(t2, p2, we2, two, rp, st2, 10 * 365.25, well_rp={"b": wet}, vrr=1.0)
+    f2 = d2[d2.forecast]
+    assert (f2.q_b - f2.qo_b).sum() > (f2.q_a - f2.qo_a).sum()
+    # Beggs-Brill: a column of water is hydrostatic; gas lightens the column; friction grows with rate
+    w_ = bb_bhp(100.0, 50.0, 1.0, 650.0, 8000.0, 8000.0, 2.992, 100.0, 200.0, pvt, 32, 0.75)
+    assert abs(w_ - (100.0 + 0.4328 * 8000.0)) < 40.0
+    a1 = bb_bhp(200.0, 1000.0, 0.0, 650.0, 8000.0, 8000.0, 2.992, 100.0, 200.0, pvt, 32, 0.75)
+    a2 = bb_bhp(200.0, 1000.0, 0.0, 3000.0, 8000.0, 8000.0, 2.992, 100.0, 200.0, pvt, 32, 0.75)
+    a3 = bb_bhp(200.0, 8000.0, 0.0, 650.0, 8000.0, 8000.0, 2.992, 100.0, 200.0, pvt, 32, 0.75)
+    assert a2 < a1 < w_ and a3 > a1
+    L = bb_lift_table([300.0], 8000.0, 8000.0, 2.992, 100.0, 200.0, pvt, 32, 0.75)
+    ref = bb_bhp(300.0, 2000.0, 0.3, 650.0, 8000.0, 8000.0, 2.992, 100.0, 200.0, pvt, 32, 0.75)
+    assert abs(L.bhp_at(300.0, 2000.0, 30.0, 650.0) / ref - 1) < 0.05
+
+
 if __name__ == "__main__":
     for k, v in list(globals().items()):
         if k.startswith("test_"):

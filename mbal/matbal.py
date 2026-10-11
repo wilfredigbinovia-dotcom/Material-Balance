@@ -26,9 +26,13 @@ class History:
     wp: np.ndarray   # STB water
     use: np.ndarray = None   # bool, pressure survey switched on
     w: np.ndarray = None     # relative weight of each pressure survey
+    wi: np.ndarray = None    # STB water injected (cumulative)
+    gi: np.ndarray = None    # scf gas injected (cumulative)
 
     def __post_init__(self):
         n = len(self.t)
+        self.wi = np.zeros(n) if self.wi is None else np.asarray(self.wi, float)
+        self.gi = np.zeros(n) if self.gi is None else np.asarray(self.gi, float)
         self.use = np.ones(n, bool) if self.use is None else np.asarray(self.use, bool)
         self.w = np.ones(n) if self.w is None else np.asarray(self.w, float)
         self.w_in = np.maximum(np.nan_to_num(self.w, nan=1.0), 0.0)   # as entered
@@ -46,8 +50,8 @@ def build_history(df, start_date, pi):
     import pandas as pd
     d = df.copy()
     d["date"] = pd.to_datetime(d["date"], errors="coerce")
-    for c in ("gp", "np", "wp"):
-        d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0.0)
+    for c in ("gp", "np", "wp", "wi", "gi"):
+        d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0.0) if c in d else 0.0
     d["p"] = pd.to_numeric(d["p"], errors="coerce")
     d["use"] = _flag(d["use"]) if "use" in d else True
     d["w"] = pd.to_numeric(d["w"], errors="coerce").fillna(1.0) if "w" in d else 1.0
@@ -69,6 +73,8 @@ def build_history(df, start_date, pi):
         wp=np.concatenate([z, d["wp"].to_numpy(float) * 1e3]),
         use=np.concatenate([[True], d["use"].to_numpy(bool)]),
         w=np.concatenate([[1.0], d["w"].to_numpy(float)]),
+        wi=np.concatenate([z, d["wi"].to_numpy(float) * 1e3]),
+        gi=np.concatenate([z, d["gi"].to_numpy(float) * 1e6]),
     )
 
 
@@ -93,7 +99,7 @@ def aggregate_wells(wells, pressures):
     pr["p"] = pd.to_numeric(pr["p"], errors="coerce")
     pr = pr.dropna(subset=["date", "p"]).sort_values("date")
     out = pd.DataFrame({"date": pr["date"].to_numpy(), "p": pr["p"].to_numpy(),
-                        "gp": 0.0, "np": 0.0, "wp": 0.0})
+                        "gp": 0.0, "np": 0.0, "wp": 0.0, "wi": 0.0, "gi": 0.0})
     out["use"] = _flag(pr["use"]).to_numpy() if "use" in pr else True
     out["w"] = (pd.to_numeric(pr["w"], errors="coerce").fillna(1.0).to_numpy()
                 if "w" in pr else 1.0)
@@ -101,7 +107,9 @@ def aggregate_wells(wells, pressures):
     for _, g in w.groupby("well"):
         g = g.sort_values("date")
         xg = g["date"].astype("int64").to_numpy(float)
-        for c in ("gp", "np", "wp"):
+        for c in ("gp", "np", "wp", "wi", "gi"):
+            if c not in g:
+                continue
             y = pd.to_numeric(g[c], errors="coerce").fillna(0.0).to_numpy(float)
             first = y[0] if len(xg) == 1 else 0.0
             out[c] += np.interp(x, xg, y, left=first if len(xg) == 1 else 0.0, right=y[-1])
@@ -146,7 +154,8 @@ class Tank:
 
     def F(self, p=None):
         p = self.h.p if p is None else p
-        return self.gpw * self.pvt.bg(p) + self.h.wp * self.bw
+        h = self.h
+        return (self.gpw - h.gi) * self.pvt.bg(p) + (h.wp - h.wi) * self.bw
 
     def We_history(self):
         """Aquifer influx driven by the measured pressures."""
@@ -201,7 +210,8 @@ class Tank:
                 p[i] = pp
                 we = aq.we_at(i, p, We)
                 return (self.G * (self.Eg(pp) + self.Efw(pp)) + we
-                        - (self.gpw[i] - self.gx_step(i, p, gx)) * self.pvt.bg(pp) - h.wp[i] * self.bw)
+                        - (self.gpw[i] - h.gi[i] - self.gx_step(i, p, gx)) * self.pvt.bg(pp)
+                        - (h.wp[i] - h.wi[i]) * self.bw)
             hi = self.pi
             try:
                 r_hi, r_lo = res(hi), res(plo)

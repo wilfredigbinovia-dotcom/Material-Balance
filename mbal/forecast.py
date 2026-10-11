@@ -58,6 +58,7 @@ def forecast(tank, p_sim, we_sim, wells, rp, state, gz, days, dt=30.4375, q_targ
             frac = 1.0 - (gx_now - gx_last) / nb_G          # neighbour gas left, fraction
             return float(np.interp(max(frac, 0.0) * pz_last, pz_vals[o_], pz_grid[o_]))
     gp, npc, wp = (np.concatenate([a, np.zeros(nf)]) for a in (h.gp, h.np_, h.wp))
+    wi_end, gi_end = float(h.wi[-1]), float(h.gi[-1])      # injection is not continued
     gpw = gp + pv.ge * npc
     cols = {k: np.full(N, np.nan) for k in ("qg", "qc", "qw", "sw", "so", "wgr", "cgr", "M")}
     qwell = {w.name: np.full(N, np.nan) for w in wells}
@@ -93,16 +94,21 @@ def forecast(tank, p_sim, we_sim, wells, rp, state, gz, days, dt=30.4375, q_targ
         gp[i], npc[i], wp[i] = gp[i - 1] + qg * step, npc[i - 1] + qc * step, wp[i - 1] + qw * step
         gpw[i] = gp[i] + pv.ge * npc[i]
 
-        if tank.has_neighbour and nb_mode == "deplete":
-            pn[i] = nb_pressure(gx[i - 1])
-
         def gx_at(pp_arr):
-            return tank.gx_step(i, pp_arr, gx, t, pn) if nb_on else gx[i - 1]
+            if not nb_on:
+                return gx[i - 1]
+            if nb_mode == "deplete":
+                # neighbour pressure and transfer solved together (implicit, stable for strong links)
+                stp = t[i] - t[i - 1]
+                fpn = lambda x: x - nb_pressure(gx[i - 1] + tank.nb_T * (x - pp_arr[i]) * stp)   # noqa: E731
+                lo_, hi_ = 14.7, max(pv.p_range[1], float(tank.nb_p[-1])) * 1.5
+                pn[i] = brentq(fpn, lo_, hi_, xtol=1e-3) if fpn(lo_) < 0 < fpn(hi_) else nb_pressure(gx[i - 1])
+            return tank.gx_step(i, pp_arr, gx, t, pn)
 
         def bal(pp):
             p[i] = pp
             return (tank.G * tank.Et(pp) + aq.we_at(i, p, We)
-                    - (gpw[i] - gx_at(p)) * pv.bg(pp) - wp[i] * tank.bw)
+                    - (gpw[i] - gi_end - gx_at(p)) * pv.bg(pp) - (wp[i] - wi_end) * tank.bw)
 
         r_hi, r_lo = bal(tank.pi), bal(plo)
         if not (np.isfinite(r_hi) and np.isfinite(r_lo)) or r_lo < 0:

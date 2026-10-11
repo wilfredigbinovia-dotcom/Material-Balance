@@ -136,3 +136,132 @@ def read_tpd(text, name="", gauge=True):
             "pressure_units": "psig" if gauge else "psia"}
     return LiftTable(q=axis_vals["q"], thp=axis_vals["thp"] + off, wgr=axis_vals["wgr"],
                      gor=axis_vals["gor"], bhp=bhp + off, turner=tur > 0.5, name=name, info=info)
+
+
+# ----------------------------------------------------------------- oil wells
+def _role(name):
+    n = name.lower()
+    if "top node" in n or "wellhead" in n or "tubing head" in n or "thp" in n or "whp" in n:
+        return "thp"
+    if "water cut" in n:
+        return "wc"
+    if "water gas" in n:
+        return "wgr"
+    if "gor" in n or "gas oil" in n:
+        return "gor"
+    if "rate" in n:
+        return "q"
+    return None
+
+
+@dataclass
+class OilLiftTable:
+    """Prosper lift curves for an oil well: bottomhole pressure against liquid (or oil) rate,
+    tubing-head pressure, water cut (%) and GOR (scf/STB)."""
+    q: np.ndarray
+    thp: np.ndarray
+    wc: np.ndarray
+    gor: np.ndarray
+    bhp: np.ndarray            # (thp, gor, wc, q)
+    rate_kind: str = "liquid"  # 'liquid' or 'oil'
+    name: str = ""
+    info: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        axes = [self.thp, np.log(np.maximum(self.gor, 1e-6)), self.wc, np.log(self.q)]
+        b = self.bhp
+        for k, a in enumerate(list(axes)):
+            if len(a) == 1:
+                axes[k] = np.array([a[0], a[0] + 1.0])
+                b = np.concatenate([b, b], axis=k)
+        self._axes = axes
+        self._f = RegularGridInterpolator(axes, b)
+
+    def bhp_at(self, thp, q_liquid, wc_pct, gor):
+        q = q_liquid if self.rate_kind == "liquid" else q_liquid * (1 - wc_pct / 100.0)
+        x = [thp, np.log(max(gor, 1e-6)), wc_pct, np.log(max(q, 1e-9))]
+        return float(self._f([[float(np.clip(v, a[0], a[-1])) for v, a in zip(x, self._axes)]])[0])
+
+    def to_dict(self):
+        return dict(q=self.q.tolist(), thp=self.thp.tolist(), wc=self.wc.tolist(), gor=self.gor.tolist(),
+                    bhp=np.round(self.bhp, 2).ravel().tolist(), rate_kind=self.rate_kind,
+                    name=self.name, info=self.info)
+
+    @classmethod
+    def from_dict(cls, d):
+        shape = (len(d["thp"]), len(d["gor"]), len(d["wc"]), len(d["q"]))
+        return cls(np.array(d["q"]), np.array(d["thp"]), np.array(d["wc"]), np.array(d["gor"]),
+                   np.array(d["bhp"], float).reshape(shape), d.get("rate_kind", "liquid"),
+                   d.get("name", ""), d.get("info", {}))
+
+
+def read_tpd_oil(text, name="", gauge=True):
+    """Parse a Prosper .tpd file made for an oil well. Variables are recognised from the
+    file's own comment lines (rate, top node pressure, water cut, GOR)."""
+    lines = [l.strip() for l in text.replace("\r", "").split("\n")]
+    names = {}
+    head = {}
+    for l in lines:
+        if not l.startswith("#"):
+            continue
+        s = l[1:].strip()
+        if ":" in s:
+            k, v = s.split(":", 1)
+            head.setdefault(k.strip(), v.strip())
+        if "=" in s and ("Variable" in s):
+            right = s.split("=", 1)[1].strip()
+            if "-" in right:
+                code, nm = right.split("-", 1)
+                try:
+                    names[int(code.strip())] = nm.strip()
+                except ValueError:
+                    pass
+    data = [l for l in lines if l and not l.startswith("#")]
+    if not data or data[0] != "TPDData":
+        raise ValueError("Not a Prosper TPD file (it should start with a TPDData record).")
+    nums = lambda s: [float(x) for x in s.split(",") if x.strip()]   # noqa: E731
+    nvar = int(nums(data[5])[0])
+    counts = [int(x) for x in nums(data[6])]
+    ncol = int(nums(data[7])[0])
+    cols = [int(x) for x in nums(data[8])]
+    types = [int(x) for x in nums(data[9])]
+    fixed = nums(data[4])
+    roles = []
+    for t in types:
+        r = _role(names.get(t, "")) if t in names else {27: "thp", 18: "wgr", 15: "gor", 4002: "q"}.get(t)
+        roles.append(r)
+    if roles[0] != "q":
+        raise ValueError("Could not recognise the table's rate variable.")
+    rname = names.get(types[0], "").lower()
+    if "gas" in rname:
+        raise ValueError("This is a gas-rate table; use it for a gas-condensate well.")
+    rate_kind = "oil" if "oil" in rname else "liquid"
+    bad = [names.get(t, str(t)) for t, r in zip(types[1:], roles[1:]) if r not in ("thp", "wc", "gor")]
+    if bad:
+        raise ValueError("Unsupported sensitivity variable(s): " + ", ".join(bad)
+                         + ". Export with tubing-head pressure, water cut and GOR.")
+    pos, values = 10, []
+    for n in counts:
+        values.append(np.array(nums(data[pos])))
+        pos += 1
+    rows = np.array([nums(l) for l in data[pos:]])
+    if rows.shape != (int(np.prod(counts)), ncol):
+        raise ValueError("The number of result rows does not match the table size.")
+    bhp = rows[:, cols.index(COL_BHP)].reshape(tuple(counts[::-1]))
+    axis_names = roles[::-1]
+    vals = dict(zip(axis_names, values[::-1]))
+    defaults = {"thp": np.array([0.0]), "wc": np.array([fixed[2] if len(fixed) > 2 and fixed[2] < 1e30 else 0.0]),
+                "gor": np.array([fixed[3] if len(fixed) > 3 and fixed[3] < 1e30 else 500.0])}
+    for k in ("thp", "gor", "wc", "q"):
+        if k not in vals:
+            vals[k] = defaults[k]
+            bhp = bhp[np.newaxis]
+            axis_names = [k] + axis_names
+    if "thp" not in roles[1:]:
+        raise ValueError("The table does not vary tubing-head pressure.")
+    bhp = np.transpose(bhp, [axis_names.index(k) for k in ("thp", "gor", "wc", "q")])
+    off = PSIG if gauge else 0.0
+    info = {"correlation": head.get("Vertical Lift Correlation", ""), "rate": names.get(types[0], ""),
+            "pressure_units": "psig" if gauge else "psia"}
+    return OilLiftTable(q=vals["q"], thp=vals["thp"] + off, wc=vals["wc"], gor=vals["gor"], bhp=bhp + off,
+                        rate_kind=rate_kind, name=name, info=info)

@@ -16,8 +16,11 @@ FLUID = dict(sg=0.72, cgr_i=85.0, api=52.0, T=260.0, pd=5200.0, co2=0.02, h2s=0.
 
 
 def default_config():
+    from .oil_sample import oil_defaults
     bw, cw, mu = water_props(6500.0, FLUID["T"], FLUID["salinity"])
-    c = dict(FLUID)
+    c = dict(oil_defaults())
+    c["fluid"] = "gas"
+    c.update(FLUID)
     c.update(pvt_pmax=7000.0,
              pi=6500.0, phi=0.18, swi=0.22, cf=4.0e-6, cw=round(cw, 8), bw=round(bw, 4),
              G=350.0,   # deliberately not the true value (roughly what p/z suggests)
