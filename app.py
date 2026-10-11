@@ -679,6 +679,7 @@ with t_pvt:
 with t_prod:
     c = st.columns([1, 2, 2])
     V["start_date"] = c[0].date_input("Start of production", value=V["start_date"], format="DD/MM/YYYY",
+                                      min_value=dt.date(1900, 1, 1), max_value=dt.date(2100, 12, 31),
                                       key=f"d_start_{KEY}",
                                       help="The reservoir is at initial pressure with zero "
                                            "cumulative production on this date.")

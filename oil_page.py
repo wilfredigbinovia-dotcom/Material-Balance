@@ -3,6 +3,7 @@
 render(g) is called by app.py with its globals, so the widget helpers, unit handling, session
 state and project file machinery are shared with the gas-condensate pages.
 """
+import datetime as dt
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -144,6 +145,7 @@ def render(g):
     with t2:
         c = st.columns([1, 2, 2])
         V["start_date"] = c[0].date_input("Start of production", value=V["start_date"], format="DD/MM/YYYY",
+                                      min_value=dt.date(1900, 1, 1), max_value=dt.date(2100, 12, 31),
                                           key=f"o_start_{KEY}")
         with c[1]:
             mode = choice("Enter production", "hist_mode", {"By reservoir": "By reservoir", "By well": "By well"},
